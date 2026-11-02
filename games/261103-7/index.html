@@ -1,0 +1,1737 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#090d2b">
+<title>ひかり粒の花火おえかき</title>
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#090d2b;
+  touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;
+  -webkit-tap-highlight-color:transparent;overscroll-behavior:none;}
+canvas{position:fixed;left:0;top:0;width:100%;height:100%;display:block;touch-action:none;
+  -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;}
+#sa{position:fixed;left:0;top:0;width:0;height:0;visibility:hidden;pointer-events:none;
+  padding-top:env(safe-area-inset-top);padding-right:env(safe-area-inset-right);
+  padding-bottom:env(safe-area-inset-bottom);padding-left:env(safe-area-inset-left);}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="sa"></div>
+<script>
+(function () {
+'use strict';
+
+/* =====================================================================
+   さらさら、くるん！ひかり粒の花火おえかき
+   - 線 = 粒が描いた順に流れる通路
+   - 線の終点 = 宝石（集めた粒の量と色を反映）
+   - 筒の口 = 宝石を吸い込み、色と量に応じた花火
+   - 閉じた輪 = 周囲の粒を渦に巻き込み、巨大な光玉 → 大花火
+   - 花火の残り粒 = 混色した新しい材料
+   ===================================================================== */
+
+var cv = document.getElementById('c');
+var ctx = cv.getContext('2d', { alpha: false });
+var saEl = document.getElementById('sa');
+
+var W = 0, H = 0, DPR = 1;
+var SA = { t: 0, r: 0, b: 0, l: 0 };
+var BG = '#090d2b';
+var TAU = Math.PI * 2;
+
+var C_PINK = [255, 118, 188], C_AQUA = [86, 206, 255], C_GOLD = [255, 204, 84],
+    C_PURPLE = [178, 122, 255], C_WHITE = [236, 240, 255], C_SILVER = [210, 220, 238];
+var CLASS_COLS = [C_PINK, C_AQUA, C_GOLD, C_PURPLE, C_WHITE];
+
+function rnd(a, b) { return a + Math.random() * (b - a); }
+function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function dist(ax, ay, bx, by) { var dx = ax - bx, dy = ay - by; return Math.sqrt(dx * dx + dy * dy); }
+function colClass(r, g, b) {
+  var best = 0, bd = 1e9;
+  for (var k = 0; k < CLASS_COLS.length; k++) {
+    var c = CLASS_COLS[k], d = (c[0] - r) * (c[0] - r) + (c[1] - g) * (c[1] - g) + (c[2] - b) * (c[2] - b);
+    if (d < bd) { bd = d; best = k; }
+  }
+  return best;
+}
+function bitCount(m) { var c = 0; while (m) { c += m & 1; m >>= 1; } return c; }
+
+/* ------------------------------ 粒プール ------------------------------ */
+var MAXP = 3000;
+var px = new Float32Array(MAXP), py = new Float32Array(MAXP),
+    vx = new Float32Array(MAXP), vy = new Float32Array(MAXP),
+    cr = new Float32Array(MAXP), cg = new Float32Array(MAXP), cb = new Float32Array(MAXP),
+    ps = new Float32Array(MAXP), sp = new Float32Array(MAXP), off = new Float32Array(MAXP),
+    life = new Float32Array(MAXP), mlife = new Float32Array(MAXP), sz = new Float32Array(MAXP),
+    hx = new Float32Array(MAXP), hy = new Float32Array(MAXP),
+    ang = new Float32Array(MAXP), rad = new Float32Array(MAXP);
+var st = new Uint8Array(MAXP), fl = new Uint8Array(MAXP);
+var nc = new Int32Array(MAXP), cl = new Int16Array(MAXP);
+var pobj = new Array(MAXP);
+var freeStack = new Int32Array(MAXP), freeTop = 0, alive = 0;
+for (var _i = 0; _i < MAXP; _i++) freeStack[freeTop++] = MAXP - 1 - _i;
+
+var S_FREE = 1, S_FLOW = 2, S_GEM = 3, S_SPARK = 4, S_SWIRL = 5, S_TUBE = 6, S_FX = 7;
+var F_EMBER = 1, F_GOLD = 2, F_TOEMBER = 4, F_STRAY = 8, F_WAIT = 16, F_TAIL = 32;
+
+function alloc() {
+  if (freeTop === 0) return -1;
+  var i = freeStack[--freeTop];
+  alive++;
+  fl[i] = 0; cl[i] = -1; pobj[i] = null; vx[i] = 0; vy[i] = 0; off[i] = 0; nc[i] = 0;
+  return i;
+}
+function kill(i) {
+  if (st[i] === 0) return;
+  if (st[i] === S_FREE && cl[i] >= 0 && clouds[cl[i]]) clouds[cl[i]].count--;
+  st[i] = 0; pobj[i] = null; freeStack[freeTop++] = i; alive--;
+}
+function setCol(i, c) { cr[i] = c[0]; cg[i] = c[1]; cb[i] = c[2]; }
+
+function spawnFX(x, y, vx0, vy0, c, l, s) {
+  var i = alloc(); if (i < 0) return -1;
+  st[i] = S_FX; px[i] = x; py[i] = y; vx[i] = vx0; vy[i] = vy0;
+  setCol(i, c); life[i] = l; mlife[i] = l; sz[i] = s;
+  return i;
+}
+
+/* ------------------------------ 状態 ------------------------------ */
+var time = 0;
+var clouds = [], lines = [], gems = [], rings = [], shells = [];
+var stroke = null, activePointer = null, ringLock = false;
+var lastInput = 0, demo = null, demoDone = false;
+var guide = { type: 'cloud', ref: null, x: 0, y: 0, t: 0 };
+var palette3 = [];
+var paletteW = [];
+var stats = { gems: 0, merges: 0, mixGems: 0, tubeFires: 0, rings: 0, ringFires: 0, emberGems: 0, cornerHolds: 0, captures: 0, taps: 0 };
+var tapPulses = [];
+var cloudTarget = 1000;
+
+var tube = {
+  x: 0, mouthY: 0, bottom: 0, w: 0, h: 0, n: 0, r: 0, g: 0, b: 0, gold: 0, cols: [],
+  timer: 0, firstAt: 0, vis: 0, lidA: 0.55, lidV: 0, wob: 0, memory: null, pulse: 0
+};
+var brush = { x: 0, y: 0, ang: -2.3, bounce: 0, vb: 0, restX: 0, restY: 0, drawing: false };
+
+/* ------------------------------ レイアウト ------------------------------ */
+function readSafeArea() {
+  try {
+    var cs = getComputedStyle(saEl);
+    SA.t = parseFloat(cs.paddingTop) || 0; SA.r = parseFloat(cs.paddingRight) || 0;
+    SA.b = parseFloat(cs.paddingBottom) || 0; SA.l = parseFloat(cs.paddingLeft) || 0;
+  } catch (e) { SA.t = SA.r = SA.b = SA.l = 0; }
+}
+function layoutTube() {
+  tube.w = Math.min(112, W * 0.26);
+  tube.h = Math.min(150, H * 0.19);
+  tube.x = W / 2;
+  tube.bottom = H - SA.b - 14;
+  tube.mouthY = tube.bottom - tube.h;
+  brush.restX = W - SA.r - Math.max(52, W * 0.09);
+  brush.restY = H - SA.b - Math.max(70, H * 0.1);
+}
+var pStamp = new Int32Array(MAXP), frameNo = 1;
+var gridW = 0, gridH = 0, CELL = 40, gHead = null, gNext = new Int32Array(MAXP);
+function resize() {
+  var nw = Math.max(1, window.innerWidth), nh = Math.max(1, window.innerHeight);
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  var ow = W, oh = H;
+  W = nw; H = nh;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  readSafeArea();
+  layoutTube();
+  gridW = Math.ceil(W / CELL) + 1; gridH = Math.ceil(H / CELL) + 1;
+  gHead = new Int32Array(gridW * gridH);
+  cloudTarget = clamp(Math.round(W * H / 330), 700, 1250);
+  if (ow > 0 && oh > 0 && (ow !== W || oh !== H)) rescale(W / ow, H / oh);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
+}
+function rescale(sx, sy) {
+  var i, k;
+  for (i = 0; i < MAXP; i++) if (st[i]) { px[i] *= sx; py[i] *= sy; }
+  for (k = 0; k < clouds.length; k++) { clouds[k].x *= sx; clouds[k].y *= sy; }
+  for (k = 0; k < lines.length; k++) {
+    var L = lines[k];
+    var oxs = L.xs, oys = L.ys;
+    for (var j = 0; j < oxs.length; j++) { oxs[j] *= sx; oys[j] *= sy; }
+    // 再サンプリングして等間隔を保つ
+    var nl = rebuildLine(L, oxs, oys);
+    // 流れている粒の位置パラメータを比率で移す
+    var ratio = L.len > 0 ? nl.len / L.len : 1;
+    for (i = 0; i < MAXP; i++) if (st[i] === S_FLOW && pobj[i] === L) { ps[i] *= ratio; nc[i] = 0; }
+    for (j = 0; j < L.corners.length; j++) L.corners[j].s *= ratio;
+    if (L.mergeLine) L.mergeS *= ratio;
+    L.xs = nl.xs; L.ys = nl.ys; L.len = nl.len; L.ts = []; L.cap = [];
+  }
+  for (k = 0; k < lines.length; k++) {
+    var M = lines[k];
+    if (M.mergeLine) M.mergeS = Math.min(M.mergeS, M.mergeLine.len);
+  }
+  for (k = 0; k < gems.length; k++) { gems[k].x *= sx; gems[k].y *= sy; gems[k].hx *= sx; gems[k].hy *= sy; if (gems[k].line) gems[k].s = Math.min(gems[k].s, gems[k].line.len); }
+  for (k = 0; k < rings.length; k++) {
+    var R = rings[k]; R.cx *= sx; R.cy *= sy; R.y0 *= sy; R.x0 *= sx;
+    for (var q = 0; q < R.px.length; q++) { R.px[q] *= sx; R.py[q] *= sy; }
+  }
+  for (k = 0; k < shells.length; k++) { shells[k].x *= sx; shells[k].y *= sy; shells[k].y0 *= sy; shells[k].apex *= sy; }
+}
+function rebuildLine(L, xs, ys) {
+  var nx = [xs[0]], ny = [ys[0]], len = 0;
+  var lx = xs[0], ly = ys[0];
+  for (var j = 1; j < xs.length; j++) {
+    var dx = xs[j] - lx, dy = ys[j] - ly, d = Math.sqrt(dx * dx + dy * dy);
+    while (d >= STEP) {
+      lx += dx / d * STEP; ly += dy / d * STEP; nx.push(lx); ny.push(ly); len += STEP;
+      dx = xs[j] - lx; dy = ys[j] - ly; d = Math.sqrt(dx * dx + dy * dy);
+    }
+  }
+  return { xs: nx, ys: ny, len: len };
+}
+
+/* ------------------------------ 粒雲 ------------------------------ */
+function setupPalette() {
+  var third = Math.random() < 0.5 ? C_PURPLE : C_WHITE;
+  palette3 = [C_PINK, C_AQUA, third];
+  var a = rnd(0.2, 0.55), b = rnd(0.2, 0.55), c = rnd(0.1, 0.35);
+  var s = a + b + c; paletteW = [a / s, b / s, c / s];
+}
+function pickPalette(avoid) {
+  for (var tries = 0; tries < 6; tries++) {
+    var r = Math.random(), acc = 0;
+    for (var k = 0; k < 3; k++) { acc += paletteW[k]; if (r <= acc) break; }
+    k = Math.min(k, 2);
+    if (palette3[k] !== avoid || tries === 5) return palette3[k];
+  }
+  return palette3[0];
+}
+function placeCloud(c) {
+  var best = null, bestD = -1e9;
+  var ymin = SA.t + c.rad + 24, ymax = Math.max(ymin + 10, Math.min(H * 0.6, tube.mouthY - 90) - c.rad);
+  var xmin = SA.l + c.rad + 10, xmax = Math.max(xmin + 10, W - SA.r - c.rad - 10);
+  for (var t = 0; t < 24; t++) {
+    var x = rnd(xmin, xmax), y = rnd(ymin, ymax);
+    var md = 1e9;
+    for (var k = 0; k < clouds.length; k++) {
+      var o = clouds[k]; if (o === c) continue;
+      md = Math.min(md, dist(x, y, o.x, o.y) - o.rad - c.rad);
+    }
+    md = Math.min(md, dist(x, y, brush.restX, brush.restY) - c.rad);
+    if (md > bestD) { bestD = md; best = [x, y]; }
+  }
+  c.x = best[0]; c.y = best[1];
+}
+function makeCloud(c, initial, forceCol) {
+  var hasGold = false;
+  for (var k = 0; k < clouds.length; k++) if (clouds[k] !== c && clouds[k].gold) hasGold = true;
+  var gold = !initial && !hasGold && Math.random() < 0.18;
+  var base = Math.min(W, H) * 0.12 + 18;
+  c.gold = gold;
+  c.col = gold ? C_GOLD : (forceCol || pickPalette(c.col));
+  c.rad = base * (gold ? 0.6 : rnd(0.8, 1.25));
+  c.tc = gold ? 70 : Math.round(rnd(0.75, 1.3) * cloudTarget / 5);
+  c.vx = rnd(-7, 7); c.vy = rnd(-4, 4);
+  c.rot = 0; c.spin = 0; c.cs = 1; c.sn = 0; c.scale = 1;
+  c.lastHit = -10; c.lowSince = -1; c.born = time;
+  placeCloud(c);
+}
+function initClouds() {
+  clouds = [];
+  // 3色は必ず1つずつ置き、残りは毎回違う偏りで選ぶ
+  var order = [0, 1, 2].sort(function () { return Math.random() - 0.5; });
+  for (var k = 0; k < 5; k++) { var c = { count: 0, col: null }; clouds.push(c); makeCloud(c, true, k < 3 ? palette3[order[k]] : null); }
+  for (k = 0; k < clouds.length; k++) {
+    var n = clouds[k].tc;
+    for (var j = 0; j < n; j++) spawnCloudParticle(k, rnd(0.2, 1));
+  }
+}
+function spawnCloudParticle(k, fade) {
+  var c = clouds[k];
+  var i = alloc(); if (i < 0) return;
+  st[i] = S_FREE; cl[i] = k; c.count++;
+  var a = Math.random() * TAU, r = c.rad * Math.pow(Math.random(), 0.7);
+  // 少しだけ塊感を出す
+  var lump = 1 + 0.25 * Math.sin(a * 3 + k);
+  hx[i] = Math.cos(a) * r * lump; hy[i] = Math.sin(a) * r * 0.8 * lump;
+  px[i] = c.x + hx[i] + rnd(-6, 6); py[i] = c.y + hy[i] + rnd(-6, 6);
+  var j = rnd(-14, 14);
+  cr[i] = clamp(c.col[0] + j, 0, 255); cg[i] = clamp(c.col[1] + j, 0, 255); cb[i] = clamp(c.col[2] + j, 0, 255);
+  life[i] = fade; sz[i] = rnd(1.3, 2.3);
+  if (c.gold) fl[i] |= F_GOLD;
+}
+function relocateCloud(k) {
+  var c = clouds[k];
+  for (var i = 0; i < MAXP; i++) if (st[i] === S_FREE && cl[i] === k) { cl[i] = -1; fl[i] |= F_STRAY; life[i] = rnd(4, 9); }
+  c.count = 0;
+  makeCloud(c, false);
+}
+function updateClouds(dt) {
+  var total = 0;
+  for (var k = 0; k < clouds.length; k++) {
+    var c = clouds[k];
+    total += c.count;
+    c.x += c.vx * dt; c.y += c.vy * dt;
+    var ymin = SA.t + c.rad + 10, ymax = Math.min(H * 0.66, tube.mouthY - 70) - c.rad * 0.6;
+    if (c.x < SA.l + c.rad * 0.7) c.vx = Math.abs(c.vx); else if (c.x > W - SA.r - c.rad * 0.7) c.vx = -Math.abs(c.vx);
+    if (c.y < ymin) c.vy = Math.abs(c.vy); else if (c.y > ymax) c.vy = -Math.abs(c.vy);
+    var guided = guide.type === 'cloud' && guide.ref === c;
+    c.scale = guided ? 1 + 0.13 * Math.sin(time * 4.2) : 1 + 0.03 * Math.sin(time * 1.3 + k);
+    c.spin = guided && stats.tubeFires > 0 && stats.rings === 0 ? 0.9 : 0.06;
+    c.rot += c.spin * dt; c.cs = Math.cos(c.rot); c.sn = Math.sin(c.rot);
+    if (c.count < c.tc * 0.14) { if (c.lowSince < 0) c.lowSince = time; } else c.lowSince = -1;
+    if (c.lowSince > 0 && time - c.lowSince > 1.8 && time - c.lastHit > 1.2) relocateCloud(k);
+  }
+  // 補充（最近集められていない雲を少しずつ）
+  if (alive < MAXP - 750 && total < cloudTarget) {
+    for (k = 0; k < clouds.length; k++) {
+      c = clouds[k];
+      if (c.count < c.tc && time - c.lastHit > 3.5) {
+        var n = (time - c.born < 3) ? 3 : 1;
+        for (var j = 0; j < n; j++) spawnCloudParticle(k, 0);
+      }
+    }
+  }
+}
+
+/* ------------------------------ 線 ------------------------------ */
+var STEP = 6, RC = 14, RA = 32;
+function newLine(x, y) {
+  return {
+    xs: [x], ys: [y], ts: [time], cap: [0], len: 0, corners: [], drawing: true, born: time, activeUntil: 1e9,
+    endType: null, endGem: null, mergeLine: null, mergeS: 0, startGem: null,
+    captured: 0, glow: 1, alpha: 1, dead: false, fading: false, used: false,
+    mergeChord: false, curv: 0, seq: lineSeq++, flowCount: 0
+  };
+}
+var lineSeq = 0;
+function addPoint(L, x, y) {
+  var n = L.xs.length;
+  var lx = L.xs[n - 1], ly = L.ys[n - 1];
+  var dx = x - lx, dy = y - ly, d = Math.sqrt(dx * dx + dy * dy);
+  var guard = 0;
+  while (d >= STEP && guard++ < 400) {
+    lx += dx / d * STEP; ly += dy / d * STEP;
+    L.xs.push(lx); L.ys.push(ly); L.ts.push(time); L.cap.push(0); L.len += STEP;
+    if (onNewPoint(L)) return true;
+    dx = x - lx; dy = y - ly; d = Math.sqrt(dx * dx + dy * dy);
+  }
+  return false;
+}
+function onNewPoint(L) {
+  var xs = L.xs, ys = L.ys, k = xs.length - 1;
+  if (k >= 8) {
+    var ax = xs[k - 4] - xs[k - 8], ay = ys[k - 4] - ys[k - 8];
+    var bx = xs[k] - xs[k - 4], by = ys[k] - ys[k - 4];
+    var a = Math.abs(Math.atan2(ax * by - ay * bx, ax * bx + ay * by));
+    L.curv = L.curv * 0.7 + a * 0.3;
+    if (a > 0.5) {
+      var cs = (k - 4) * STEP;
+      var last = L.corners[L.corners.length - 1];
+      var gap = 0.035 + 0.11 * clamp((a - 0.5) / 1.8, 0, 1);
+      if (last && cs - last.s < 30) {
+        if (a > last.a) { last.s = cs; last.a = a; last.gap = gap; }
+      } else L.corners.push({ s: cs, a: a, gap: gap, next: 0, hold: 0 });
+    }
+  }
+  // 輪の閉鎖判定
+  if (L.drawing && L.len > 190 && rings.length < 3) {
+    var lim = k - Math.ceil(170 / STEP);
+    for (var j = lim; j >= 0; j--) {
+      var dx = xs[k] - xs[j], dy = ys[k] - ys[j];
+      if (dx * dx + dy * dy < 34 * 34) {
+        var area = 0;
+        for (var q = j; q < k; q++) area += xs[q] * ys[q + 1] - xs[q + 1] * ys[q];
+        area = Math.abs(area) / 2;
+        if (area > 4200) { makeRing(L, j, k); return true; }
+      }
+    }
+  }
+  return false;
+}
+function lineNormal(L, k) {
+  var n = L.xs.length;
+  var a = Math.max(0, k - 1), b = Math.min(n - 1, k + 1);
+  if (a === b) return [0, -1];
+  var dx = L.xs[b] - L.xs[a], dy = L.ys[b] - L.ys[a], d = Math.sqrt(dx * dx + dy * dy) || 1;
+  return [-dy / d, dx / d];
+}
+var _ip = { x: 0, y: 0, nx: 0, ny: 0 };
+function interp(L, s) {
+  var n = L.xs.length;
+  var f = s / STEP; if (f < 0) f = 0;
+  var k = f | 0;
+  if (k >= n - 1) { k = n - 2; f = n - 1; }
+  if (k < 0) { _ip.x = L.xs[0]; _ip.y = L.ys[0]; _ip.nx = 0; _ip.ny = -1; return _ip; }
+  var t = f - k;
+  var x0 = L.xs[k], y0 = L.ys[k], x1 = L.xs[k + 1], y1 = L.ys[k + 1];
+  _ip.x = x0 + (x1 - x0) * t; _ip.y = y0 + (y1 - y0) * t;
+  var dx = x1 - x0, dy = y1 - y0, d = Math.sqrt(dx * dx + dy * dy) || 1;
+  _ip.nx = -dy / d; _ip.ny = dx / d;
+  return _ip;
+}
+function firstCornerAfter(L, s) {
+  var c = L.corners, k = 0;
+  while (k < c.length && c[k].s <= s + 0.5) k++;
+  return k;
+}
+function nearestOnLine(L, x, y) {
+  var best = 1e9, bk = -1;
+  for (var k = 0; k < L.xs.length; k++) {
+    var dx = L.xs[k] - x, dy = L.ys[k] - y, d = dx * dx + dy * dy;
+    if (d < best) { best = d; bk = k; }
+  }
+  return { d: Math.sqrt(best), k: bk };
+}
+function extendTo(L, x, y) {
+  addPointRaw(L, x, y);
+}
+function addPointRaw(L, x, y) {
+  var n = L.xs.length, lx = L.xs[n - 1], ly = L.ys[n - 1];
+  var dx = x - lx, dy = y - ly, d = Math.sqrt(dx * dx + dy * dy), guard = 0;
+  while (d >= STEP && guard++ < 200) {
+    lx += dx / d * STEP; ly += dy / d * STEP;
+    L.xs.push(lx); L.ys.push(ly); L.ts.push(time); L.cap.push(0); L.len += STEP;
+    dx = x - lx; dy = y - ly; d = Math.sqrt(dx * dx + dy * dy);
+  }
+}
+function finishStroke(L) {
+  L.drawing = false;
+  if (L.len < 18) {
+    // タップ：線は作らない
+    removeLine(L, true);
+    return;
+  }
+  var ex = L.xs[L.xs.length - 1], ey = L.ys[L.xs.length - 1];
+  var mx = tube.x, my = tube.mouthY;
+  var k, best, bd;
+  // 1) 筒の口
+  if (dist(ex, ey, mx, my) < tube.w * 0.6 + 34 || (Math.abs(ex - mx) < tube.w * 0.6 && ey > my - 30 && ey < tube.bottom)) {
+    L.endType = 'tube';
+    extendTo(L, mx, my + 4);
+  } else {
+    // 2) 宝石
+    best = null; bd = 1e9;
+    for (k = 0; k < gems.length; k++) {
+      var g = gems[k];
+      if (g === L.startGem || g.state === 'suck' || g.dead) continue;
+      var d = dist(ex, ey, g.x, g.y);
+      if (d < g.R + 36 && d < bd) { bd = d; best = g; }
+    }
+    if (best) {
+      L.endType = 'gem'; L.endGem = best;
+      extendTo(L, best.x, best.y);
+    } else {
+      // 3) 既存の線（合流）
+      var bl = null, bk = -1; bd = 1e9;
+      for (k = 0; k < lines.length; k++) {
+        var M = lines[k];
+        if (M === L || M.dead || M.fading || M.drawing || M.seq > L.seq) continue;
+        var r = nearestOnLine(M, ex, ey);
+        if (r.d < 30 && r.d < bd) { bd = r.d; bl = M; bk = r.k; }
+      }
+      if (bl) {
+        L.endType = 'merge'; L.mergeLine = bl; L.mergeS = bk * STEP;
+        extendTo(L, bl.xs[bk], bl.ys[bk]);
+        bl.used = true;
+      } else {
+        L.endType = 'gem'; L.endGem = null;
+      }
+    }
+  }
+  L.activeUntil = time + 1.1;
+  if (L.startGem && !L.startGem.dead) {
+    var sg = L.startGem;
+    sg.state = 'carry'; sg.line = L; sg.s = 0; sg.cv = 170;
+    L.used = true;
+  }
+  // 線の上限
+  var live = 0;
+  for (k = 0; k < lines.length; k++) if (!lines[k].dead && !lines[k].fading) live++;
+  if (live > 28) {
+    for (k = 0; k < lines.length; k++) { if (!lines[k].dead && !lines[k].fading && lines[k] !== L) { lines[k].fading = true; break; } }
+  }
+}
+function removeLine(L, quiet) {
+  if (L.dead) return;
+  L.dead = true;
+  for (var i = 0; i < MAXP; i++) {
+    if (st[i] === S_FLOW && pobj[i] === L) {
+      st[i] = S_FREE; cl[i] = -1; fl[i] = (fl[i] & F_GOLD) | F_STRAY; life[i] = rnd(4, 8); pobj[i] = null;
+    }
+  }
+  for (var k = 0; k < lines.length; k++) {
+    var M = lines[k];
+    if (M.mergeLine === L) { M.mergeLine = null; M.endType = 'gem'; M.endGem = null; }
+  }
+  for (k = 0; k < gems.length; k++) {
+    if (gems[k].line === L) { gems[k].line = null; gems[k].state = 'rest'; gems[k].lastAdd = time; }
+  }
+  var idx = lines.indexOf(L); if (idx >= 0) lines.splice(idx, 1);
+  if (stroke === L) stroke = null;
+}
+function arrive(i, L) {
+  if (L.drawing) return false;
+  if (L.endType === 'merge' && L.mergeLine && !L.mergeLine.dead) {
+    var M = L.mergeLine;
+    if (!L.mergeChord) {
+      L.mergeChord = true; stats.merges++;
+      var e = interp(M, L.mergeS);
+      sparkle(e.x, e.y, [cr[i], cg[i], cb[i]], 10, 70);
+      sfxChord(0);
+    }
+    pobj[i] = M; ps[i] = L.mergeS; nc[i] = firstCornerAfter(M, L.mergeS);
+    M.used = true; M.glow = 1;
+    return true;
+  }
+  if (L.endType === 'tube') { toTube(i); return true; }
+  // 宝石
+  var g = L.endGem;
+  if (!g || g.dead) {
+    var n = L.xs.length;
+    g = makeGem(L.xs[n - 1], L.ys[n - 1]);
+    L.endGem = g;
+    if (fl[i] & F_EMBER) g.fromEmber = true;
+  }
+  gemAdd(g, i);
+  return true;
+}
+
+/* ------------------------------ 宝石 ------------------------------ */
+var gemSeq = 0;
+function makeGem(x, y) {
+  var g = {
+    id: gemSeq++, x: x, y: y, hx: x, hy: y, R: 3, members: [], total: 0, r: 0, g: 0, b: 0, gold: 0,
+    ar: 255, ag: 255, ab: 255, cls: 0, rot: rnd(0, TAU), sq: 0, sv: 0, lastAdd: time,
+    state: 'grow', line: null, s: 0, dead: false, scale: 1, born: time, fromEmber: false, emberN: 0, glow: 1
+  };
+  gems.push(g); stats.gems++;
+  return g;
+}
+function gemAdd(g, i) {
+  var r = cr[i], gg = cg[i], b = cb[i];
+  g.r += r; g.g += gg; g.b += b; g.total++;
+  if (fl[i] & F_GOLD) g.gold++;
+  if (fl[i] & F_EMBER) { g.emberN++; if (g.emberN === 3) stats.emberGems++; }
+  g.ar = g.r / g.total; g.ag = g.g / g.total; g.ab = g.b / g.total;
+  var c = 1 << colClass(r, gg, b);
+  if (!(g.cls & c)) {
+    var before = bitCount(g.cls);
+    g.cls |= c;
+    if (before >= 1) { sfxChord(1 + Math.min(2, before)); sparkle(g.x, g.y, [r, gg, b], 16, 90); stats.mixGems++; g.glow = 1.6; }
+  }
+  g.lastAdd = time;
+  if (g.state === 'rest') g.state = 'grow';
+  g.sv += 2.2 / (1 + g.total * 0.04);
+  if (g.members.length < 90) {
+    st[i] = S_GEM; pobj[i] = g; nc[i] = g.members.length; g.members.push(i);
+    fl[i] &= ~(F_WAIT | F_STRAY | F_TOEMBER);
+  } else {
+    kill(i);
+  }
+  sfxGemPing(g.total);
+}
+function gemTarget(g) { return 5 + Math.sqrt(g.total) * 1.9; }
+function removeGem(g) {
+  g.dead = true;
+  var idx = gems.indexOf(g); if (idx >= 0) gems.splice(idx, 1);
+  for (var k = 0; k < lines.length; k++) if (lines[k].endGem === g) lines[k].endGem = null;
+}
+function mergeGems(a, b) {
+  var mem = a.members.slice();
+  var extraN = a.total - mem.length;
+  // メンバー以外の分（上限超過分）は色の平均で加算
+  if (extraN > 0) {
+    b.r += a.ar * extraN; b.g += a.ag * extraN; b.b += a.ab * extraN; b.total += extraN;
+    b.gold += Math.max(0, a.gold - countGoldMembers(a));
+  }
+  a.members = [];
+  removeGem(a);
+  for (var k = 0; k < mem.length; k++) gemAdd(b, mem[k]);
+  b.sv += 3;
+}
+function countGoldMembers(g) { var n = 0; for (var k = 0; k < g.members.length; k++) if (fl[g.members[k]] & F_GOLD) n++; return n; }
+function updateGems(dt) {
+  for (var k = gems.length - 1; k >= 0; k--) {
+    var g = gems[k];
+    g.R += (gemTarget(g) - g.R) * Math.min(1, dt * 6);
+    g.rot += dt * (0.9 + 6 / (g.R + 6));
+    g.sv += (-g.sq * 140 - g.sv * 7) * dt; g.sq += g.sv * dt; g.sq = clamp(g.sq, -0.5, 0.5);
+    g.glow = Math.max(1, g.glow - dt);
+    if (g.state === 'grow' && time - g.lastAdd > 0.75) { g.state = 'rest'; g.sv += 1.2; sfxGemDone(g.total); }
+    if (g.state === 'carry') {
+      var L = g.line;
+      if (!L || L.dead) { g.state = 'rest'; g.line = null; continue; }
+      g.cv = Math.min(520, (g.cv || 170) + dt * 420);
+      g.s += dt * g.cv;
+      if (g.s >= L.len) {
+        g.line = null;
+        var e = interp(L, L.len); g.x = e.x; g.y = e.y;
+        if (L.endType === 'tube') { g.state = 'suck'; sfxSuck(); }
+        else if (L.endType === 'gem' && L.endGem && !L.endGem.dead && L.endGem !== g) { mergeGems(g, L.endGem); continue; }
+        else if (L.endType === 'merge' && L.mergeLine && !L.mergeLine.dead) { g.line = L.mergeLine; g.s = L.mergeS; }
+        else { g.state = 'rest'; g.lastAdd = time; if (!L.endGem || L.endGem.dead) L.endGem = g; }
+      } else {
+        var p = interp(L, g.s); g.x = p.x; g.y = p.y;
+      }
+    } else if (g.state === 'suck') {
+      var tx = tube.x, ty = tube.mouthY + 6;
+      g.x += (tx - g.x) * Math.min(1, dt * 7); g.y += (ty - g.y) * Math.min(1, dt * 7);
+      g.scale = Math.max(0.25, g.scale - dt * 1.4);
+      if (dist(g.x, g.y, tx, ty) < 10) {
+        var mem = g.members.slice(), extra = g.total - mem.length;
+        for (var q = 0; q < mem.length; q++) toTube(mem[q]);
+        if (extra > 0) tubeAddRaw(g.ar, g.ag, g.ab, extra, Math.max(0, g.gold - countGoldMembersList(mem)));
+        g.members = [];
+        removeGem(g);
+        tube.wob = Math.max(tube.wob, 0.6);
+        continue;
+      }
+    } else if (g.state === 'rest') {
+      g.scale += (1 - g.scale) * Math.min(1, dt * 5);
+      if (dist(g.x, g.y, tube.x, tube.mouthY) < 125 && g.total >= 2) { g.state = 'suck'; sfxSuck(); }
+    } else {
+      g.scale += (1 - g.scale) * Math.min(1, dt * 5);
+    }
+  }
+}
+function countGoldMembersList(mem) { var n = 0; for (var k = 0; k < mem.length; k++) if (fl[mem[k]] & F_GOLD) n++; return n; }
+
+/* ------------------------------ 筒 ------------------------------ */
+function toTube(i) {
+  tubeAddRaw(cr[i], cg[i], cb[i], 1, (fl[i] & F_GOLD) ? 1 : 0);
+  if (tube.vis >= 140) { kill(i); return; }
+  st[i] = S_TUBE; pobj[i] = null; hx[i] = 0; tube.vis++;
+  ang[i] = Math.random() * TAU; rad[i] = Math.random();
+  fl[i] &= F_GOLD;
+}
+function tubeAddRaw(r, g, b, n, gold) {
+  if (tube.n === 0) tube.firstAt = time;
+  tube.n += n; tube.r += r * n; tube.g += g * n; tube.b += b * n; tube.gold += gold;
+  if (tube.cols.length < 160) tube.cols.push([r, g, b]);
+  else tube.cols[(Math.random() * tube.cols.length) | 0] = [r, g, b];
+  if (time - tube.firstAt < 2.6) tube.timer = 1.0;
+  tube.lidV += 0.6;
+  tube.pulse = 1;
+}
+function launchTube() {
+  var c = { n: tube.n, r: tube.r, g: tube.g, b: tube.b, gold: tube.gold, cols: tube.cols };
+  c.avg = [c.r / c.n, c.g / c.n, c.b / c.n];
+  tube.memory = c.avg.slice();
+  tube.n = 0; tube.r = tube.g = tube.b = 0; tube.gold = 0; tube.cols = []; tube.timer = 0;
+  tube.lidV -= 9; tube.wob = 1;
+  for (var i = 0; i < MAXP; i++) {
+    if (st[i] === S_TUBE) {
+      st[i] = S_FX; vx[i] = rnd(-40, 40); vy[i] = rnd(-420, -250); life[i] = mlife[i] = rnd(0.25, 0.45); sz[i] = 2;
+    }
+  }
+  tube.vis = 0;
+  var R = clamp(46 + Math.sqrt(c.n) * 14, 50, Math.min(W, H) * 0.42);
+  var top = SA.t + R + 16;
+  var frac = 0.45 + 0.55 * Math.min(1, c.n / 110);
+  var apex = tube.mouthY - (tube.mouthY - top) * frac;
+  apex = Math.max(top, Math.min(apex, tube.mouthY - 140));
+  shells.push({ kind: 'tube', x: tube.x, y: tube.mouthY, y0: tube.mouthY, apex: apex, t: 0, T: 0.9 + 0.5 * frac, c: c, R: R, tt: 0 });
+  stats.tubeFires++;
+  sfxLaunch(0.9 + 0.5 * frac);
+}
+function updateTube(dt) {
+  if (tube.n > 0) {
+    tube.timer -= dt;
+    if (tube.timer <= 0) launchTube();
+  }
+  // ふた：満ちると震える
+  var rest = 0.55 + (tube.n > 0 ? 0.08 * Math.sin(time * 18) * Math.min(1, tube.n / 40) : 0);
+  tube.lidV += (rest - tube.lidA) * 60 * dt; tube.lidV *= Math.exp(-5 * dt); tube.lidA += tube.lidV * dt;
+  tube.wob = Math.max(0, tube.wob - dt * 1.6);
+  tube.pulse = Math.max(0, tube.pulse - dt * 2);
+}
+
+/* ------------------------------ 花火 ------------------------------ */
+var emberCount = 0;
+function burst(x, y, c, R, big) {
+  var avg = c.n > 0 ? c.avg : C_WHITE.slice();
+  var count = big ? clamp(260 + c.n * 2.4, 260, 1100) : clamp(55 + c.n * 2.6, 55, 520);
+  count = Math.min(count, freeTop - 60);
+  var goldF = c.gold > 0 ? Math.min(0.55, 0.18 + c.gold / Math.max(1, c.n) * 1.5) : 0;
+  var emberCap = (big ? 320 : 150);
+  var emberP = Math.min(0.5, emberCap / Math.max(1, count));
+  if (emberCount > 520) emberP *= 0.3;
+  var info = { avg: avg };
+  var drag = 2.1;
+  for (var k = 0; k < count; k++) {
+    var i = alloc(); if (i < 0) break;
+    initSpark(i, x, y, c, R, big, k, goldF, emberP, info, drag);
+  }
+  sfxBurst(big ? 1 : Math.min(1, 0.35 + c.n / 160), goldF > 0);
+}
+function initSpark(i, x, y, c, R, big, k, goldF, emberP, info, drag) {
+  var a = Math.random() * TAU;
+  var layer = 1;
+  if (big) layer = (k % 3 === 0) ? rnd(0.45, 0.7) : ((k % 7 === 0) ? rnd(0.15, 0.4) : 1);
+  var v = R * drag * layer * (big ? rnd(0.7, 1.05) : rnd(0.6, 1.05));
+  st[i] = S_SPARK; px[i] = x; py[i] = y; vx[i] = Math.cos(a) * v; vy[i] = Math.sin(a) * v;
+  var col = (c.cols && c.cols.length) ? c.cols[(Math.random() * c.cols.length) | 0] : info.avg;
+  cr[i] = Math.min(255, col[0] + 25); cg[i] = Math.min(255, col[1] + 25); cb[i] = Math.min(255, col[2] + 25);
+  life[i] = mlife[i] = rnd(1.15, 1.7) + (big ? 0.4 : 0);
+  sz[i] = rnd(1.8, 2.8);
+  fl[i] = 0; pobj[i] = info; ang[i] = 0;
+  if (goldF > 0 && Math.random() < goldF) {
+    setCol(i, C_GOLD); fl[i] |= F_GOLD | F_TAIL; life[i] = mlife[i] = rnd(2.2, 2.9);
+  }
+  if (Math.random() < emberP) fl[i] |= F_TOEMBER;
+}
+function updateShells(dt) {
+  for (var k = shells.length - 1; k >= 0; k--) {
+    var s = shells[k];
+    s.t += dt;
+    var u = Math.min(1, s.t / s.T);
+    s.y = s.y0 + (s.apex - s.y0) * (1 - Math.pow(1 - u, 2.2));
+    s.tt += dt;
+    if (s.tt > 0.025 && freeTop > 200) {
+      s.tt = 0;
+      var gc = s.c.gold > 0 && Math.random() < 0.6;
+      spawnFX(s.x + rnd(-2, 2), s.y + 4, rnd(-12, 12), rnd(20, 60), gc ? C_GOLD : (s.c.avg || C_SILVER), gc ? 1.0 : 0.5, 1.6);
+    }
+    if (u >= 1) {
+      shells.splice(k, 1);
+      burst(s.x, s.y, s.c, s.R, false);
+    }
+  }
+}
+
+/* ------------------------------ 輪 ------------------------------ */
+function makeRing(L, j, k) {
+  var polyX = [], polyY = [], cx = 0, cy = 0, n = 0;
+  for (var q = j; q <= k; q++) { polyX.push(L.xs[q]); polyY.push(L.ys[q]); cx += L.xs[q]; cy += L.ys[q]; n++; }
+  cx /= n; cy /= n;
+  var rr = 0;
+  for (q = 0; q < polyX.length; q++) rr += dist(polyX[q], polyY[q], cx, cy);
+  rr /= polyX.length;
+  var R = {
+    cx: cx, cy: cy, x0: cx, y0: cy, rr: rr, px: polyX, py: polyY, t: 0, phase: 'gather', gT: 1.9,
+    n: 0, r: 0, g: 0, b: 0, gold: 0, cols: [], ballR: 6, riseT: 0, apex: 0, xT: cx, hum: null
+  };
+  rings.push(R); stats.rings++;
+  // 線上の粒 → 渦
+  for (var i = 0; i < MAXP; i++) if (st[i] === S_FLOW && pobj[i] === L) toSwirl(i, R);
+  // 輪の中の宝石 → 渦
+  for (var g = gems.length - 1; g >= 0; g--) {
+    var G = gems[g];
+    if (G.state === 'suck') continue;
+    if (dist(G.x, G.y, cx, cy) < rr * 1.05) {
+      var mem = G.members.slice(), extra = G.total - mem.length;
+      for (q = 0; q < mem.length; q++) toSwirl(mem[q], R);
+      if (extra > 0) { R.n += extra; R.r += G.ar * extra; R.g += G.ag * extra; R.b += G.ab * extra; }
+      G.members = [];
+      removeGem(G);
+    }
+  }
+  L.drawing = false;
+  removeLine(L, true);
+  stroke = null; ringLock = true;
+  stopDrawVoice();
+  R.hum = sfxRingHum(R.gT + 1.5);
+  sparkleRing(R);
+}
+function toSwirl(i, R) {
+  if (st[i] === S_FREE && cl[i] >= 0 && clouds[cl[i]]) { clouds[cl[i]].count--; clouds[cl[i]].lastHit = time; }
+  st[i] = S_SWIRL; pobj[i] = R; cl[i] = -1;
+  ang[i] = Math.atan2(py[i] - R.cy, px[i] - R.cx);
+  rad[i] = dist(px[i], py[i], R.cx, R.cy);
+  hx[i] = rnd(0.15, 1);
+  R.n++; R.r += cr[i]; R.g += cg[i]; R.b += cb[i];
+  if (fl[i] & F_GOLD) R.gold++;
+  if (R.cols.length < 160) R.cols.push([cr[i], cg[i], cb[i]]);
+  else R.cols[(Math.random() * 160) | 0] = [cr[i], cg[i], cb[i]];
+  fl[i] &= F_GOLD;
+}
+function sparkleRing(R) {
+  for (var q = 0; q < R.px.length; q += 2) spawnFX(R.px[q], R.py[q], rnd(-10, 10), rnd(-10, 10), C_WHITE, 0.7, 1.8);
+}
+function updateRings(dt) {
+  for (var k = rings.length - 1; k >= 0; k--) {
+    var R = rings[k];
+    R.t += dt;
+    R.ballR = 7 + Math.sqrt(R.n) * 2.1;
+    if (R.phase === 'gather') {
+      if (R.t >= R.gT) {
+        R.phase = 'rise'; R.riseT = 0;
+        var c = ringContents(R);
+        var big = clamp(Math.min(W, H) * 0.2 + Math.sqrt(c.n) * 9.5, 90, Math.min(W, H) * 0.48);
+        R.burstR = big;
+        R.apex = Math.max(SA.t + big + 12, Math.min(H * 0.36, R.cy - 60));
+        R.apex = Math.min(R.apex, Math.max(SA.t + big + 12, H * 0.5));
+        R.xT = clamp(R.cx, SA.l + big + 8, W - SA.r - big - 8);
+        if (W < 2 * big + 16) R.xT = W / 2;
+        R.y0 = R.cy; R.x0 = R.cx;
+        R.T = 1.3 + 0.4 * Math.min(1, Math.abs(R.cy - R.apex) / H);
+        sfxLaunch(R.T, true);
+      }
+    } else if (R.phase === 'rise') {
+      R.riseT += dt;
+      var u = Math.min(1, R.riseT / R.T);
+      var e = u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2;
+      R.cy = R.y0 + (R.apex - R.y0) * e;
+      R.cx = R.x0 + (R.xT - R.x0) * e;
+      if (freeTop > 250) spawnFX(R.cx + rnd(-R.ballR, R.ballR) * 0.5, R.cy + R.ballR, rnd(-15, 15), rnd(40, 90), ringAvg(R), 0.6, 1.8);
+      if (u >= 1) { ringBurst(R); rings.splice(k, 1); }
+    }
+  }
+}
+function ringAvg(R) { return R.n > 0 ? [R.r / R.n, R.g / R.n, R.b / R.n] : C_WHITE; }
+function ringContents(R) {
+  return { n: R.n, r: R.r, g: R.g, b: R.b, gold: R.gold, cols: R.cols.length ? R.cols : [C_WHITE], avg: ringAvg(R) };
+}
+function ringBurst(R) {
+  var c = ringContents(R);
+  var big = R.burstR;
+  var goldF = c.gold > 0 ? Math.min(0.55, 0.2 + c.gold / Math.max(1, c.n) * 1.5) : 0;
+  var info = { avg: c.avg };
+  var emberP = Math.min(0.45, 320 / Math.max(1, c.n + 300));
+  if (emberCount > 520) emberP *= 0.3;
+  var k = 0;
+  // 渦の粒をそのまま火花へ
+  for (var i = 0; i < MAXP; i++) {
+    if (st[i] === S_SWIRL && pobj[i] === R) { initSpark(i, R.cx, R.cy, c, big, true, k++, goldF, emberP, info, 2.1); }
+  }
+  // 追加の火花で視界いっぱいに
+  var extra = Math.min(clamp(300 + c.n, 300, 900) - k, freeTop - 80);
+  for (var q = 0; q < extra; q++) {
+    i = alloc(); if (i < 0) break;
+    initSpark(i, R.cx, R.cy, c, big, true, k++, goldF, emberP, info, 2.1);
+  }
+  stats.ringFires++;
+  sfxBurst(1.25, goldF > 0);
+  // 少し遅れて周りで小さく弾ける
+  R.after = 0;
+  pendingPops.push({ x: R.cx, y: R.cy, R: big, t: 0.55, c: c, n: Math.min(6, 2 + Math.floor(c.n / 60)) });
+}
+var pendingPops = [];
+function updatePops(dt) {
+  for (var k = pendingPops.length - 1; k >= 0; k--) {
+    var p = pendingPops[k];
+    p.t -= dt;
+    if (p.t <= 0) {
+      pendingPops.splice(k, 1);
+      var info = { avg: p.c.avg };
+      for (var m = 0; m < p.n; m++) {
+        var a = Math.random() * TAU, d = p.R * rnd(0.55, 0.85);
+        var x = p.x + Math.cos(a) * d, y = p.y + Math.sin(a) * d;
+        for (var q = 0; q < 22; q++) {
+          var i = alloc(); if (i < 0) break;
+          initSpark(i, x, y, p.c, p.R * 0.22, false, q, 0, 0, info, 2.4);
+          life[i] = mlife[i] = rnd(0.6, 0.9);
+        }
+      }
+      sfxCrackle(p.n);
+    }
+  }
+}
+
+/* ------------------------------ 捕獲（グリッド） ------------------------------ */
+function buildGrid() {
+  gHead.fill(-1);
+  for (var i = 0; i < MAXP; i++) {
+    if (st[i] !== S_FREE) continue;
+    var gx = (px[i] / CELL) | 0, gy = (py[i] / CELL) | 0;
+    if (gx < 0) gx = 0; else if (gx >= gridW) gx = gridW - 1;
+    if (gy < 0) gy = 0; else if (gy >= gridH) gy = gridH - 1;
+    var c = gy * gridW + gx;
+    gNext[i] = gHead[c]; gHead[c] = i;
+  }
+}
+function capture(i, L, k, x, y) {
+  if (cl[i] >= 0 && clouds[cl[i]]) { clouds[cl[i]].count--; clouds[cl[i]].lastHit = time; }
+  cl[i] = -1;
+  st[i] = S_FLOW; pobj[i] = L;
+  var s = k * STEP;
+  ps[i] = s;
+  var nrm = lineNormal(L, k);
+  off[i] = (px[i] - x) * nrm[0] + (py[i] - y) * nrm[1];
+  sp[i] = 30;
+  nc[i] = firstCornerAfter(L, s);
+  fl[i] &= (F_GOLD | F_EMBER);
+  life[i] = 1;
+  L.captured++; L.glow = 1;
+  stats.captures++;
+  sfxSara();
+}
+function captureFrame(dt) {
+  var need = false, k;
+  for (k = 0; k < lines.length; k++) { var L = lines[k]; if (!L.dead && (L.drawing || time < L.activeUntil) && L.len >= 18) { need = true; break; } }
+  if (!need && tapPulses.length === 0 && rings.length === 0) return;
+  buildGrid();
+  frameNo++;
+  var RA2 = RA * RA, RC2 = RC * RC;
+  for (k = 0; k < lines.length; k++) {
+    L = lines[k];
+    if (L.dead || L.fading || !(L.drawing || time < L.activeUntil) || L.len < 18) continue;
+    var n = L.xs.length;
+    var pull = 1;
+    for (var q = 0; q < n; q += 2) {
+      // 筆が通った直後の場所だけが粒を吸う（線の長さではなく、通った粒の量で決まる）
+      var age = time - (L.ts[q] || -9);
+      if (age > 0.55 || L.cap[q] >= 7) continue;
+      var x = L.xs[q], y = L.ys[q];
+      var gx0 = Math.max(0, ((x - RA) / CELL) | 0), gx1 = Math.min(gridW - 1, ((x + RA) / CELL) | 0);
+      var gy0 = Math.max(0, ((y - RA) / CELL) | 0), gy1 = Math.min(gridH - 1, ((y + RA) / CELL) | 0);
+      for (var gy = gy0; gy <= gy1; gy++) for (var gx = gx0; gx <= gx1; gx++) {
+        for (var i = gHead[gy * gridW + gx]; i !== -1; i = gNext[i]) {
+          if (st[i] !== S_FREE) continue;
+          var dx = x - px[i], dy = y - py[i], d2 = dx * dx + dy * dy;
+          if (d2 < RC2) { if (L.cap[q] < 7) { L.cap[q]++; capture(i, L, q, x, y); } }
+          else if (d2 < RA2 && pStamp[i] !== frameNo) {
+            pStamp[i] = frameNo;
+            var d = Math.sqrt(d2);
+            vx[i] += dx / d * 190 * pull * dt; vy[i] += dy / d * 190 * pull * dt;
+          }
+        }
+      }
+    }
+  }
+  // タップで近くの粒が寄る
+  for (k = tapPulses.length - 1; k >= 0; k--) {
+    var tp = tapPulses[k];
+    tp.t -= dt;
+    if (tp.t <= 0) { tapPulses.splice(k, 1); continue; }
+    var r = 70;
+    gx0 = Math.max(0, ((tp.x - r) / CELL) | 0); gx1 = Math.min(gridW - 1, ((tp.x + r) / CELL) | 0);
+    gy0 = Math.max(0, ((tp.y - r) / CELL) | 0); gy1 = Math.min(gridH - 1, ((tp.y + r) / CELL) | 0);
+    for (gy = gy0; gy <= gy1; gy++) for (gx = gx0; gx <= gx1; gx++) {
+      for (i = gHead[gy * gridW + gx]; i !== -1; i = gNext[i]) {
+        if (st[i] !== S_FREE) continue;
+        dx = tp.x - px[i]; dy = tp.y - py[i]; d2 = dx * dx + dy * dy;
+        if (d2 < r * r && d2 > 100) { d = Math.sqrt(d2); vx[i] += dx / d * 110 * dt; vy[i] += dy / d * 110 * dt; }
+      }
+    }
+  }
+  // 輪：周囲の粒を巻き込む
+  for (k = 0; k < rings.length; k++) {
+    var R = rings[k];
+    if (R.phase !== 'gather') continue;
+    var rc = R.rr * 1.12, ra = R.rr * 1.7, budget = 70;
+    gx0 = Math.max(0, ((R.cx - ra) / CELL) | 0); gx1 = Math.min(gridW - 1, ((R.cx + ra) / CELL) | 0);
+    gy0 = Math.max(0, ((R.cy - ra) / CELL) | 0); gy1 = Math.min(gridH - 1, ((R.cy + ra) / CELL) | 0);
+    for (gy = gy0; gy <= gy1; gy++) for (gx = gx0; gx <= gx1; gx++) {
+      for (i = gHead[gy * gridW + gx]; i !== -1; i = gNext[i]) {
+        if (st[i] !== S_FREE) continue;
+        dx = R.cx - px[i]; dy = R.cy - py[i]; d2 = dx * dx + dy * dy;
+        if (d2 < rc * rc && budget > 0) { toSwirl(i, R); budget--; }
+        else if (d2 < ra * ra) {
+          d = Math.sqrt(d2);
+          // 渦を巻きながら寄る
+          vx[i] += (dx / d * 300 - dy / d * 220) * dt; vy[i] += (dy / d * 300 + dx / d * 220) * dt;
+        }
+      }
+    }
+  }
+}
+
+/* ------------------------------ 粒の更新 ------------------------------ */
+var sndCornerT = 0;
+function updateParticles(dt) {
+  var damp = Math.exp(-2.6 * dt), sdamp = Math.exp(-2.1 * dt);
+  emberCount = 0;
+  var tubeIdx = 0;
+  for (var i = 0; i < MAXP; i++) {
+    var s = st[i];
+    if (s === 0) continue;
+    if (s === S_FREE) {
+      if (cl[i] >= 0) {
+        var c = clouds[cl[i]];
+        var hxr = (hx[i] * c.cs - hy[i] * c.sn) * c.scale, hyr = (hx[i] * c.sn + hy[i] * c.cs) * c.scale;
+        var tx = c.x + hxr, ty = c.y + hyr;
+        vx[i] += ((tx - px[i]) * 3.2 + (Math.random() - 0.5) * 50) * dt;
+        vy[i] += ((ty - py[i]) * 3.2 + (Math.random() - 0.5) * 50) * dt;
+        vx[i] *= damp; vy[i] *= damp;
+        if (life[i] < 1) life[i] = Math.min(1, life[i] + dt * 0.9);
+      } else {
+        // 降る粒・はぐれ粒
+        if (fl[i] & F_EMBER) {
+          emberCount++;
+          vy[i] += (16 - vy[i]) * dt * 0.8;
+          vx[i] += (Math.sin(time * 1.1 + i * 0.7) * 14 - vx[i]) * dt * 0.8;
+        } else {
+          vx[i] *= damp; vy[i] *= damp;
+          vy[i] += 4 * dt;
+        }
+        life[i] -= dt;
+        if (life[i] <= 0 || py[i] > H + 12 || px[i] < -20 || px[i] > W + 20) { kill(i); continue; }
+      }
+      px[i] += vx[i] * dt; py[i] += vy[i] * dt;
+    } else if (s === S_FLOW) {
+      updateFlow(i, dt);
+    } else if (s === S_GEM) {
+      var g = pobj[i];
+      if (!g || g.dead) { st[i] = S_FREE; cl[i] = -1; fl[i] |= F_STRAY; life[i] = 5; continue; }
+      var n = g.members.length || 1, k = nc[i];
+      var R = g.R * g.scale;
+      var a = k * 2.39996 + g.rot;
+      var rr = R * Math.sqrt((k + 0.5) / n);
+      var seg = 1.0471976, m = ((a % seg) + seg) % seg - seg / 2;
+      var f = 0.866 / Math.cos(m);
+      var bob = Math.sin(time * 2 + g.id) * 2 + (guide.type === 'gem' && guide.ref === g ? -Math.abs(Math.sin(time * 4.5)) * 8 : 0);
+      tx = g.x + Math.cos(a) * rr * f * (1 + g.sq);
+      ty = g.y + bob + Math.sin(a) * rr * f * (1 - g.sq) * 0.9;
+      var kk = Math.min(1, dt * 14);
+      px[i] += (tx - px[i]) * kk; py[i] += (ty - py[i]) * kk;
+    } else if (s === S_SPARK) {
+      vx[i] *= sdamp; vy[i] *= sdamp; vy[i] += 34 * dt;
+      px[i] += vx[i] * dt; py[i] += vy[i] * dt;
+      life[i] -= dt;
+      var info = pobj[i];
+      if ((fl[i] & F_TOEMBER) && info && life[i] < 0.7) {
+        var t = Math.min(1, dt * 3);
+        cr[i] += (info.avg[0] - cr[i]) * t; cg[i] += (info.avg[1] - cg[i]) * t; cb[i] += (info.avg[2] - cb[i]) * t;
+      }
+      if (fl[i] & F_TAIL) {
+        ang[i] += dt;
+        if (ang[i] > 0.05 && freeTop > 450) { ang[i] = 0; spawnFX(px[i], py[i], vx[i] * 0.05, 12, C_GOLD, 1.1, 1.3); }
+      }
+      if (life[i] <= 0) {
+        if ((fl[i] & F_TOEMBER) && info) {
+          st[i] = S_FREE; cl[i] = -1; fl[i] = (fl[i] & F_GOLD) | F_EMBER; pobj[i] = null;
+          cr[i] = info.avg[0]; cg[i] = info.avg[1]; cb[i] = info.avg[2];
+          life[i] = rnd(18, 28); vx[i] *= 0.3; vy[i] = rnd(6, 14); sz[i] = rnd(1.6, 2.4);
+        } else kill(i);
+      }
+    } else if (s === S_SWIRL) {
+      var Rg = pobj[i];
+      if (!Rg) { kill(i); continue; }
+      var target;
+      if (Rg.phase === 'gather') {
+        var u = Math.min(1, Rg.t / Rg.gT);
+        target = lerp(Rg.rr * hx[i], Rg.ballR * hx[i], u * u);
+        rad[i] += (target - rad[i]) * Math.min(1, dt * (1.2 + u * 3));
+      } else {
+        target = Rg.ballR * hx[i];
+        rad[i] += (target - rad[i]) * Math.min(1, dt * 6);
+      }
+      ang[i] += (1.4 + 70 / (rad[i] + 12)) * dt;
+      px[i] = Rg.cx + Math.cos(ang[i]) * rad[i];
+      py[i] = Rg.cy + Math.sin(ang[i]) * rad[i] * 0.92;
+    } else if (s === S_TUBE) {
+      tubeIdx++;
+      var mx = tube.x, my = tube.mouthY + 4;
+      if (hx[i] < 1) {
+        px[i] += (mx - px[i]) * Math.min(1, dt * 9); py[i] += (my - py[i]) * Math.min(1, dt * 9);
+        if (dist(px[i], py[i], mx, my) < 6) hx[i] = 1;
+      } else {
+        ang[i] += dt * (1.5 + rad[i]);
+        var level = Math.min(1, tube.vis / 140);
+        var yy = tube.bottom - 8 - rad[i] * (tube.h - 16) * (0.15 + 0.85 * level);
+        tx = tube.x + Math.sin(ang[i]) * tube.w * 0.36;
+        px[i] += (tx - px[i]) * Math.min(1, dt * 8); py[i] += (yy - py[i]) * Math.min(1, dt * 5);
+      }
+    } else if (s === S_FX) {
+      vx[i] *= damp; vy[i] *= damp;
+      px[i] += vx[i] * dt; py[i] += vy[i] * dt;
+      life[i] -= dt;
+      if (life[i] <= 0) kill(i);
+    }
+  }
+  tube.vis = tubeIdx;
+}
+function updateFlow(i, dt) {
+  var L = pobj[i];
+  if (!L || L.dead) { st[i] = S_FREE; cl[i] = -1; fl[i] |= F_STRAY; life[i] = 5; return; }
+  var vmax = 205;
+  var s = ps[i];
+  var nearEnd = L.len - s;
+  if (L.drawing && nearEnd < 10) {
+    // 描いている途中：筆先に溜まって押し合う
+    sp[i] = 0;
+    off[i] += (Math.random() - 0.5) * 60 * dt;
+    off[i] = clamp(off[i], -9, 9);
+    s = Math.max(0, L.len - 4 - Math.abs(off[i]) * 0.6);
+  } else {
+    var waiting = false;
+    sp[i] = Math.min(vmax, sp[i] + 520 * dt);
+    if (nearEnd < 26) { sp[i] = Math.min(sp[i], 70 + nearEnd * 4); off[i] += (Math.random() - 0.5) * 50 * dt; }
+    var ns = s + sp[i] * dt;
+    var cs = L.corners, ci = nc[i];
+    while (ci < cs.length && cs[ci].s <= ns) {
+      var co = cs[ci];
+      if (time < co.next) {
+        // 曲がり角で詰まる
+        ns = Math.max(s, co.s - 1.5 - Math.random() * 4);
+        sp[i] = 0; waiting = true;
+        if (!(fl[i] & F_WAIT)) { fl[i] |= F_WAIT; co.hold++; stats.cornerHolds++; }
+        break;
+      } else {
+        co.next = time + co.gap;
+        if (fl[i] & F_WAIT) { fl[i] &= ~F_WAIT; co.hold = Math.max(0, co.hold - 1); }
+        ci++;
+        if (time - sndCornerT > 0.07) { sndCornerT = time; sfxCorner(co.a, ci); }
+      }
+    }
+    nc[i] = ci;
+    if (waiting) {
+      off[i] += (Math.random() - 0.5) * 90 * dt;
+      off[i] = clamp(off[i], -8, 8);
+    } else {
+      off[i] *= Math.exp(-3.5 * dt);
+    }
+    s = ns;
+    if (s >= L.len && !L.drawing) {
+      if (arrive(i, L)) return;
+      s = L.len;
+    }
+  }
+  ps[i] = s;
+  var p = interp(L, s);
+  var tx = p.x + p.nx * off[i], ty = p.y + p.ny * off[i];
+  // 伸び：速いほど進行方向へ
+  px[i] += (tx - px[i]) * Math.min(1, dt * 22); py[i] += (ty - py[i]) * Math.min(1, dt * 22);
+  L.flowCount++;
+}
+
+/* ------------------------------ 線の更新 ------------------------------ */
+function updateLines(dt) {
+  for (var k = lines.length - 1; k >= 0; k--) {
+    var L = lines[k];
+    L.glow = Math.max(0, L.glow - dt * 0.8);
+    if (L.flowCount > 0) L.glow = Math.max(L.glow, 0.5);
+    L.flowCount = 0;
+    if (L.drawing) continue;
+    if (L.fading) {
+      L.alpha -= dt * 0.8;
+      if (L.alpha <= 0) removeLine(L);
+      continue;
+    }
+    var hasCarry = false;
+    for (var q = 0; q < gems.length; q++) if (gems[q].line === L) hasCarry = true;
+    if (L.captured === 0 && !L.used && !hasCarry && time - L.born > 7) L.fading = true;
+  }
+}
+
+/* ------------------------------ 入力 ------------------------------ */
+function evPos(e) {
+  return { x: clamp(e.clientX, 0, W), y: clamp(e.clientY, 0, H) };
+}
+function hitTube(x, y) {
+  return x > tube.x - tube.w / 2 - 18 && x < tube.x + tube.w / 2 + 18 && y > tube.mouthY - 26 && y < tube.bottom + 14;
+}
+function hitBrush(x, y) {
+  return dist(x, y, brush.x, brush.y) < 44 || dist(x, y, brush.x - Math.cos(brush.ang) * 40, brush.y - Math.sin(brush.ang) * 40) < 40;
+}
+function beginTouch(x, y) {
+  stats.taps++;
+  // 即時の手応え：短い粒の筆跡＋きらめき
+  var a = brush.ang;
+  for (var q = -3; q <= 3; q++) {
+    spawnFX(x + Math.cos(a) * q * 3.2, y + Math.sin(a) * q * 3.2, rnd(-6, 6), rnd(-6, 6), C_SILVER, 1.1, 2.0);
+  }
+  for (q = 0; q < 8; q++) {
+    var aa = q / 8 * TAU;
+    spawnFX(x, y, Math.cos(aa) * 70, Math.sin(aa) * 70, C_WHITE, 0.45, 1.5);
+  }
+  tapPulses.push({ x: x, y: y, t: 0.3 });
+  var hitT = hitTube(x, y), hitB = hitBrush(x, y);
+  if (hitT) { tube.wob = 1; tube.lidV -= 4; sfxPop(330); }
+  else if (hitB) { brush.vb += 9; sfxPop(520); }
+  var startGem = null, bd = 1e9;
+  for (var k = 0; k < gems.length; k++) {
+    var g = gems[k];
+    if (g.state === 'suck' || g.state === 'carry') continue;
+    var d = dist(x, y, g.x, g.y);
+    if (d < g.R + 34 && d < bd) { bd = d; startGem = g; }
+  }
+  if (startGem) { startGem.sv += 3; sfxGemPing(startGem.total + 40); }
+  if (!hitT && !hitB && !startGem) sfxTap(y);
+  var L = newLine(startGem ? startGem.x : x, startGem ? startGem.y : y);
+  L.startGem = startGem;
+  if (startGem) addPointRaw(L, x, y);
+  lines.push(L);
+  stroke = L;
+  ringLock = false;
+  brush.drawing = true;
+  startDrawVoice();
+}
+function moveTouch(x, y) {
+  if (!stroke || ringLock) return;
+  addPoint(stroke, x, y);
+  if (stroke) {
+    var n = stroke.xs.length;
+    if (n > 3) {
+      var dx = stroke.xs[n - 1] - stroke.xs[n - 3], dy = stroke.ys[n - 1] - stroke.ys[n - 3];
+      if (dx || dy) brush.moveAng = Math.atan2(dy, dx);
+    }
+    // 筆跡の銀の光
+    if (freeTop > 300 && Math.random() < 0.7) spawnFX(x + rnd(-3, 3), y + rnd(-3, 3), rnd(-20, 20), rnd(-20, 20), C_SILVER, 0.5, 1.7);
+    updateDrawVoice(stroke.curv);
+  }
+}
+function endTouch() {
+  if (stroke) finishStroke(stroke);
+  stroke = null; ringLock = false;
+  brush.drawing = false;
+  stopDrawVoice();
+}
+var pointerPos = { x: 0, y: 0 };
+cv.addEventListener('pointerdown', function (e) {
+  e.preventDefault();
+  initAudio();
+  lastInput = time;
+  if (demo) { demo = null; demoDone = true; }
+  if (activePointer !== null) return; // 追加の指は無視
+  activePointer = e.pointerId;
+  try { cv.setPointerCapture(e.pointerId); } catch (err) {}
+  var p = evPos(e);
+  pointerPos.x = p.x; pointerPos.y = p.y;
+  beginTouch(p.x, p.y);
+}, { passive: false });
+cv.addEventListener('pointermove', function (e) {
+  if (e.pointerId !== activePointer) return;
+  e.preventDefault();
+  lastInput = time;
+  var list = (e.getCoalescedEvents && e.getCoalescedEvents()) || null;
+  if (list && list.length) {
+    for (var k = 0; k < list.length; k++) { var p = evPos(list[k]); moveTouch(p.x, p.y); }
+  } else { p = evPos(e); moveTouch(p.x, p.y); }
+  pointerPos.x = p.x; pointerPos.y = p.y;
+}, { passive: false });
+function upHandler(e) {
+  if (e.pointerId !== activePointer) return;
+  if (e.type === 'pointerup') { var p = evPos(e); moveTouch(p.x, p.y); }
+  activePointer = null;
+  try { cv.releasePointerCapture(e.pointerId); } catch (err) {}
+  endTouch();
+}
+cv.addEventListener('pointerup', upHandler);
+cv.addEventListener('pointercancel', upHandler);
+cv.addEventListener('lostpointercapture', function (e) { if (e.pointerId === activePointer) { activePointer = null; endTouch(); } });
+window.addEventListener('blur', function () { if (activePointer !== null) { activePointer = null; endTouch(); } });
+document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+document.addEventListener('gesturestart', function (e) { e.preventDefault(); });
+document.addEventListener('touchmove', function (e) { e.preventDefault(); }, { passive: false });
+document.addEventListener('dblclick', function (e) { e.preventDefault(); });
+
+/* ------------------------------ 誘導・お手本 ------------------------------ */
+function updateGuide(dt) {
+  guide.t -= dt;
+  if (guide.t > 0 && !(guide.ref && guide.ref.dead)) { trackGuide(); return; }
+  guide.t = 0.5;
+  // 1) 筒から離れて休んでいる宝石
+  var best = null;
+  for (var k = 0; k < gems.length; k++) {
+    var g = gems[k];
+    if (g.state !== 'rest' || g.total < 3) continue;
+    if (!best || g.born > best.born) best = g;
+  }
+  if (best) { guide.type = 'gem'; guide.ref = best; trackGuide(); return; }
+  // 2) 降っている混色の粒
+  if (emberCount > 40) {
+    var sx = 0, sy = 0, n = 0;
+    for (var i = 0; i < MAXP; i++) if (st[i] === S_FREE && (fl[i] & F_EMBER)) { sx += px[i]; sy += py[i]; n++; }
+    if (n > 0) { guide.type = 'embers'; guide.ref = null; guide.x = sx / n; guide.y = sy / n; return; }
+  }
+  // 3) 粒雲（多いもの、前回と違う色を優先）
+  if (guide.type !== 'cloud' || !guide.ref || guide.ref.count < guide.ref.tc * 0.35 || Math.random() < 0.06) {
+    var bc = null, bs = -1;
+    for (k = 0; k < clouds.length; k++) {
+      var c = clouds[k];
+      var sc = c.count * (c === guide.ref ? 0.6 : 1) * (c.gold ? 1.4 : 1);
+      if (sc > bs) { bs = sc; bc = c; }
+    }
+    guide.type = 'cloud'; guide.ref = bc;
+  }
+  trackGuide();
+}
+function trackGuide() {
+  if (guide.type === 'cloud' && guide.ref) { guide.x = guide.ref.x; guide.y = guide.ref.y; }
+  else if (guide.type === 'gem' && guide.ref) { guide.x = guide.ref.x; guide.y = guide.ref.y; }
+}
+function updateDemo(dt) {
+  if (!demoDone && !demo && time - lastInput > 4 && stats.taps === 0 && guide.type === 'cloud' && guide.ref) {
+    var c = guide.ref;
+    var sx = c.x - c.rad * 0.8, sy = c.y + c.rad * 0.15, ex = c.x + c.rad * 0.8, ey = c.y - c.rad * 0.15;
+    demo = { t: 0, sx: sx, sy: sy, ex: ex, ey: ey, ox: brush.restX, oy: brush.restY, trail: [] };
+  }
+  if (!demo) return;
+  demo.t += dt;
+  var t = demo.t;
+  var x, y, down = false;
+  if (t < 0.9) { var u = easeIO(t / 0.9); x = lerp(demo.ox, demo.sx, u); y = lerp(demo.oy, demo.sy, u); }
+  else if (t < 2.2) { u = easeIO((t - 0.9) / 1.3); x = lerp(demo.sx, demo.ex, u); y = lerp(demo.sy, demo.ey, u); down = true; }
+  else { x = demo.ex; y = demo.ey - (t - 2.2) * 30; }
+  demo.x = x; demo.y = y; demo.down = down;
+  if (down && freeTop > 100) {
+    spawnFX(x + rnd(-2, 2), y + rnd(-2, 2), 0, 0, C_SILVER, 1.0, 1.8);
+  }
+  if (t > 3.0) { demo = null; demoDone = true; }
+}
+function easeIO(u) { return u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2; }
+function updateBrush(dt) {
+  var tx, ty, ta;
+  if (brush.drawing && activePointer !== null) {
+    tx = pointerPos.x; ty = pointerPos.y;
+    // 筆の柄は右下へ。動きに合わせて少し傾く
+    ta = -2.2 + (brush.moveAng !== undefined ? Math.sin(brush.moveAng) * 0.25 : 0);
+    brush.x += (tx - brush.x) * Math.min(1, dt * 30); brush.y += (ty - brush.y) * Math.min(1, dt * 30);
+    brush.vb += Math.sin(time * 14) * 3 * dt * 10;
+  } else {
+    var gx = guide.x, gy = guide.y;
+    var a = Math.atan2(gy - brush.restY, gx - brush.restX);
+    tx = brush.restX + Math.cos(a) * 14; ty = brush.restY + Math.sin(a) * 14;
+    ta = a + Math.sin(time * 2.2) * 0.12;
+    brush.x += (tx - brush.x) * Math.min(1, dt * 5); brush.y += (ty - brush.y) * Math.min(1, dt * 5);
+  }
+  var da = ta - brush.ang;
+  while (da > Math.PI) da -= TAU; while (da < -Math.PI) da += TAU;
+  brush.ang += da * Math.min(1, dt * 8);
+  brush.vb += (-brush.bounce * 160 - brush.vb * 9) * dt; brush.bounce += brush.vb * dt;
+  brush.bounce = clamp(brush.bounce, -0.4, 0.5);
+}
+
+/* ------------------------------ 描画 ------------------------------ */
+var sprites = new Map();
+function sprite(r, g, b) {
+  var key = ((r | 0) >> 4) << 8 | ((g | 0) >> 4) << 4 | ((b | 0) >> 4);
+  var s = sprites.get(key);
+  if (s) return s;
+  if (sprites.size > 1500) sprites.clear();
+  var R = (key >> 8 & 15) * 17, G = (key >> 4 & 15) * 17, B = (key & 15) * 17;
+  s = document.createElement('canvas'); s.width = s.height = 32;
+  var c = s.getContext('2d');
+  var gr = c.createRadialGradient(16, 16, 0, 16, 16, 16);
+  gr.addColorStop(0, 'rgba(' + Math.min(255, R + 90) + ',' + Math.min(255, G + 90) + ',' + Math.min(255, B + 90) + ',1)');
+  gr.addColorStop(0.22, 'rgba(' + R + ',' + G + ',' + B + ',0.95)');
+  gr.addColorStop(0.5, 'rgba(' + R + ',' + G + ',' + B + ',0.28)');
+  gr.addColorStop(1, 'rgba(' + R + ',' + G + ',' + B + ',0)');
+  c.fillStyle = gr; c.fillRect(0, 0, 32, 32);
+  sprites.set(key, s);
+  return s;
+}
+function dot(x, y, size, col, a) {
+  if (a <= 0.01) return;
+  ctx.globalAlpha = a > 1 ? 1 : a;
+  var s = sprite(col[0], col[1], col[2]);
+  var h = size * 2.2;
+  ctx.drawImage(s, x - h, y - h, h * 2, h * 2);
+}
+var _col = [0, 0, 0];
+function render() {
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = 'rgba(9,13,43,0.42)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = 'lighter';
+  drawTube();
+  drawLines();
+  drawGems();
+  drawParticles();
+  drawShells();
+  drawRings();
+  drawBrush();
+  drawDemo();
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+function drawTube() {
+  var x = tube.x, top = tube.mouthY, bot = tube.bottom, w = tube.w;
+  var wob = Math.sin(time * 22) * tube.wob * 4;
+  var tint = tube.memory ? tube.memory : C_AQUA;
+  var wallCol = [lerp(170, tint[0], 0.45), lerp(200, tint[1], 0.45), lerp(240, tint[2], 0.45)];
+  // 壁（疎な粒で透明感）
+  var stepY = 11;
+  for (var y = top + 8; y < bot - 4; y += stepY) {
+    var u = (y - top) / (bot - top);
+    var sw = Math.sin(time * 1.5 + y * 0.05) * 0.6;
+    dot(x - w / 2 + wob * u + sw, y, 1.3, wallCol, 0.42);
+    dot(x + w / 2 - wob * u - sw, y, 1.3, wallCol, 0.42);
+  }
+  // 底の楕円
+  for (var q = 0; q < 14; q++) {
+    var a = q / 14 * TAU;
+    dot(x + Math.cos(a) * w / 2, bot + Math.sin(a) * w * 0.13, 1.1, wallCol, Math.sin(a) > 0 ? 0.42 : 0.15);
+  }
+  // 口（開いた輪）
+  var mouthA = 0.62 + 0.25 * tube.pulse + 0.08 * Math.sin(time * 2);
+  for (q = 0; q < 26; q++) {
+    a = q / 26 * TAU + time * 0.3;
+    dot(x + Math.cos(a) * (w / 2 + wob), top + Math.sin(a) * w * 0.15, 1.6, C_WHITE, mouthA * (Math.sin(a) > 0 ? 1 : 0.6));
+  }
+  // ふた（右端を軸に開いている）
+  var hingeX = x + w / 2 + 2, hingeY = top - 2;
+  var la = Math.PI + tube.lidA;
+  for (q = 1; q <= 10; q++) {
+    var d = q / 10 * w * 0.98;
+    dot(hingeX + Math.cos(la) * d, hingeY - Math.sin(tube.lidA) * d * 0.9 - (q === 10 ? 0 : 0), 1.5, C_SILVER, 0.55);
+  }
+}
+function drawLines() {
+  for (var k = 0; k < lines.length; k++) {
+    var L = lines[k];
+    var n = L.xs.length;
+    if (n < 2) continue;
+    var base = L.drawing ? 0.55 : (0.16 + L.glow * 0.25);
+    if (!L.drawing && time < L.activeUntil) base = Math.max(base, 0.42 * (L.activeUntil - time) / 1.1 + 0.16);
+    base *= L.alpha;
+    for (var q = 0; q < n; q += 2) dot(L.xs[q], L.ys[q], 1.05, C_SILVER, base);
+    // 流れる向き：ゆっくり進む光
+    if (!L.drawing && L.len > 30) {
+      var ph = (time * 70) % 42;
+      for (var s = ph; s < L.len; s += 42) { var p = interp(L, s); dot(p.x, p.y, 1.5, C_WHITE, 0.32 * L.alpha); }
+    }
+    // 終点の目印（空の終点）
+    if (!L.drawing && L.endType === 'gem' && !L.endGem && L.captured > 0) {
+      dot(L.xs[n - 1], L.ys[n - 1], 2.5, C_WHITE, 0.3 * L.alpha);
+    }
+  }
+}
+function drawGems() {
+  for (var k = 0; k < gems.length; k++) {
+    var g = gems[k];
+    var hl = guide.type === 'gem' && guide.ref === g;
+    var pulse = hl ? 0.25 + 0.2 * Math.sin(time * 4.5) : 0;
+    var avg = [g.ar, g.ag, g.ab];
+    var R = g.R * g.scale;
+    dot(g.x, g.y, R * 0.9 + 3, avg, (0.16 + pulse) * g.glow);
+    dot(g.x, g.y, R * 0.3 + 2, avg, 0.22 + pulse);
+    // きらめく稜線（回転）
+    if (g.state === 'rest' || hl) {
+      for (var q = 0; q < 6; q++) {
+        var a = g.rot + q * 1.0472;
+        var tw = 0.5 + 0.5 * Math.sin(time * 5 + q * 2 + g.id);
+        dot(g.x + Math.cos(a) * (R + 4), g.y + Math.sin(a) * (R + 4) * 0.9, 1.4, C_WHITE, 0.25 + 0.4 * tw);
+      }
+    }
+    if (g.gold > 0) dot(g.x, g.y - R - 6, 1.8, C_GOLD, 0.5 + 0.4 * Math.sin(time * 6));
+  }
+}
+function drawParticles() {
+  var gHL = guide.type === 'embers';
+  for (var i = 0; i < MAXP; i++) {
+    var s = st[i];
+    if (s === 0) continue;
+    var a = 1, size = sz[i];
+    _col[0] = cr[i]; _col[1] = cg[i]; _col[2] = cb[i];
+    if (s === S_FREE) {
+      if (cl[i] >= 0) {
+        var c = clouds[cl[i]];
+        var hl = guide.type === 'cloud' && guide.ref === c;
+        a = life[i] * (hl ? 0.85 + 0.15 * Math.sin(time * 4.2) : 0.62);
+        if (hl) size *= 1.2;
+      } else if (fl[i] & F_EMBER) {
+        a = Math.min(1, life[i] / 3) * (0.65 + 0.35 * Math.sin(time * 7 + i));
+        if (gHL) { a = Math.min(1, a * 1.3); size *= 1.25; }
+      } else {
+        a = Math.min(0.6, life[i] / 4);
+      }
+    } else if (s === S_FLOW) {
+      size *= (fl[i] & F_WAIT) ? 1.35 : 1.1;
+      a = 0.95;
+    } else if (s === S_GEM) {
+      var g = pobj[i];
+      if (g) { _col[0] = lerp(cr[i], g.ar, 0.45); _col[1] = lerp(cg[i], g.ag, 0.45); _col[2] = lerp(cb[i], g.ab, 0.45); }
+      size *= 0.95; a = clamp(0.2 + 16 / (g ? g.members.length || 1 : 16), 0.3, 0.9);
+    } else if (s === S_SPARK) {
+      a = Math.min(0.8, life[i] / 0.6);
+      if (fl[i] & F_TOEMBER) a = Math.max(a, 0.55);
+    } else if (s === S_SWIRL) {
+      var Rr = pobj[i];
+      a = Rr && Rr.phase !== 'gather' ? clamp(0.1 + 40 / (Rr.n + 1), 0.13, 1) : 0.85; size *= 1.1;
+    } else if (s === S_TUBE) {
+      a = 0.85;
+    } else if (s === S_FX) {
+      a = life[i] / mlife[i];
+    }
+    dot(px[i], py[i], size, _col, a);
+  }
+}
+function drawShells() {
+  for (var k = 0; k < shells.length; k++) {
+    var s = shells[k];
+    dot(s.x, s.y, 3.2, C_WHITE, 1);
+    dot(s.x, s.y, 5, s.c.avg, 0.6);
+  }
+}
+function drawRings() {
+  for (var k = 0; k < rings.length; k++) {
+    var R = rings[k];
+    var col = ringAvg(R);
+    if (R.phase === 'gather') {
+      var u = Math.min(1, R.t / R.gT);
+      var sc = 1 - u * 0.85, rot = u * u * 4;
+      var cs = Math.cos(rot), sn = Math.sin(rot);
+      for (var q = 0; q < R.px.length; q += 2) {
+        var dx = (R.px[q] - R.x0) * sc, dy = (R.py[q] - R.y0) * sc;
+        dot(R.cx + dx * cs - dy * sn, R.cy + dx * sn + dy * cs, 1.4, C_WHITE, 0.6 * (1 - u) + 0.1);
+      }
+    }
+    dot(R.cx, R.cy, R.ballR * 1.1 + 4, col, 0.3);
+    dot(R.cx, R.cy, R.ballR * 0.35 + 2, col, 0.4);
+  }
+}
+function drawBrush() {
+  var a = brush.ang;
+  var tipX = brush.x, tipY = brush.y;
+  var bx = -Math.cos(a), by = -Math.sin(a); // 柄の方向
+  var nx = -by, ny = bx;
+  var len = 92 * (1 + brush.bounce);
+  // 穂先（ふくらむ）
+  for (var q = 0; q <= 8; q++) {
+    var t = q / 8 * 0.42;
+    var wdt = Math.sin(q / 8 * Math.PI * 0.85) * 9;
+    var cx = tipX + bx * len * t, cy = tipY + by * len * t;
+    dot(cx, cy, 1.5, C_SILVER, 0.75);
+    if (wdt > 1.5) { dot(cx + nx * wdt, cy + ny * wdt, 1.2, C_SILVER, 0.5); dot(cx - nx * wdt, cy - ny * wdt, 1.2, C_SILVER, 0.5); }
+  }
+  // 金具の輪
+  var fx = tipX + bx * len * 0.47, fy = tipY + by * len * 0.47;
+  for (q = -2; q <= 2; q++) dot(fx + nx * q * 3, fy + ny * q * 3, 1.4, C_WHITE, 0.6);
+  // 柄
+  for (q = 0; q < 7; q++) {
+    t = 0.53 + q * 0.07;
+    dot(tipX + bx * len * t, tipY + by * len * t, 1.6 - q * 0.08, C_SILVER, 0.45);
+  }
+  // 筆先の光
+  var tw = brush.drawing ? 1 : 0.6 + 0.3 * Math.sin(time * 3);
+  dot(tipX, tipY, 3, C_WHITE, tw);
+}
+function drawDemo() {
+  if (!demo) return;
+  var x = demo.x, y = demo.y;
+  var fade = demo.t < 0.3 ? demo.t / 0.3 : (demo.t > 2.6 ? Math.max(0, (3 - demo.t) / 0.4) : 1);
+  var al = 0.75 * fade;
+  var dx = 0.55, dy = 0.83; // 指は右下から伸びる
+  // 指先
+  for (var q = 0; q < 8; q++) { var a = q / 8 * TAU; dot(x + Math.cos(a) * 7, y + Math.sin(a) * 7 + (demo.down ? 0 : -3), 1.4, C_WHITE, al); }
+  // 指
+  for (var t = 0; t < 60; t += 8) {
+    var cx = x + dx * (t + 8), cy = y + dy * (t + 8);
+    dot(cx - dy * 8, cy + dx * 8, 1.3, C_WHITE, al * 0.8); dot(cx + dy * 8, cy - dx * 8, 1.3, C_WHITE, al * 0.8);
+  }
+  // 手のひら
+  var hx0 = x + dx * 92, hy0 = y + dy * 92;
+  for (q = 0; q < 14; q++) { a = q / 14 * TAU; dot(hx0 + Math.cos(a) * 30, hy0 + Math.sin(a) * 26, 1.3, C_WHITE, al * 0.6); }
+  if (demo.down) dot(x, y, 4, C_SILVER, al * 1.5);
+}
+
+/* ------------------------------ 音（Web Audio 合成） ------------------------------ */
+var AC = null, master = null, noiseBuf = null, drawV = null;
+var sndT = { sara: 0, ping: 0, tap: 0, chord: 0 };
+function initAudio() {
+  try {
+    if (AC) { if (AC.state === 'suspended') AC.resume().catch(function () {}); return; }
+    var Ctor = window.AudioContext || window.webkitAudioContext;
+    if (!Ctor) return;
+    AC = new Ctor();
+    var comp = AC.createDynamicsCompressor();
+    comp.threshold.value = -18; comp.knee.value = 12; comp.ratio.value = 4;
+    master = AC.createGain(); master.gain.value = 0.5;
+    master.connect(comp); comp.connect(AC.destination);
+    var len = AC.sampleRate * 1.5;
+    noiseBuf = AC.createBuffer(1, len, AC.sampleRate);
+    var d = noiseBuf.getChannelData(0);
+    for (var i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    // iOSの解錠用に無音を一度鳴らす
+    var src = AC.createBufferSource(); src.buffer = AC.createBuffer(1, 1, 22050); src.connect(master); src.start(0);
+    if (AC.state === 'suspended') AC.resume().catch(function () {});
+  } catch (e) { AC = null; }
+}
+function ok() { return AC && AC.state === 'running' && master; }
+function tone(f, dur, type, vol, opt) {
+  if (!ok()) return;
+  try {
+    opt = opt || {};
+    var t0 = AC.currentTime + (opt.delay || 0);
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = type || 'sine';
+    o.frequency.setValueAtTime(f, t0);
+    if (opt.to) o.frequency.exponentialRampToValueAtTime(opt.to, t0 + dur);
+    if (opt.detune) o.detune.value = opt.detune;
+    var at = opt.attack || 0.008;
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(vol, t0 + at);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g); g.connect(master);
+    o.start(t0); o.stop(t0 + dur + 0.05);
+  } catch (e) {}
+}
+function noise(dur, vol, ftype, freq, opt) {
+  if (!ok() || !noiseBuf) return;
+  try {
+    opt = opt || {};
+    var t0 = AC.currentTime + (opt.delay || 0);
+    var s = AC.createBufferSource(); s.buffer = noiseBuf;
+    var f = AC.createBiquadFilter(); f.type = ftype; f.frequency.setValueAtTime(freq, t0);
+    if (opt.to) f.frequency.exponentialRampToValueAtTime(opt.to, t0 + dur);
+    f.Q.value = opt.q || 0.8;
+    var g = AC.createGain();
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(vol, t0 + (opt.attack || 0.005));
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    s.connect(f); f.connect(g); g.connect(master);
+    s.start(t0, Math.random() * 0.5); s.stop(t0 + dur + 0.05);
+  } catch (e) {}
+}
+var PENTA = [523.25, 587.33, 659.25, 783.99, 880, 1046.5, 1174.7, 1318.5, 1568];
+function sfxTap(y) { if (time - sndT.tap < 0.05) return; sndT.tap = time; tone(PENTA[clamp(8 - Math.floor(y / H * 8), 0, 8)] * 2, 0.18, 'sine', 0.08); }
+function sfxPop(f) { tone(f, 0.22, 'sine', 0.16, { to: f * 0.6 }); tone(f * 1.5, 0.12, 'triangle', 0.05); }
+function sfxSara() {
+  if (time - sndT.sara < 0.045) return; sndT.sara = time;
+  noise(0.06, 0.035, 'highpass', 5200 + Math.random() * 2500, { q: 0.5 });
+}
+function sfxCorner(a, idx) { tone(900 + (idx % 5) * 140, 0.07, 'triangle', 0.045 + Math.min(0.04, a * 0.02)); }
+function sfxGemPing(n) {
+  if (time - sndT.ping < 0.09) return; sndT.ping = time;
+  var f = 1400 / (1 + Math.sqrt(n) * 0.06);
+  tone(f, 0.25, 'sine', 0.055); tone(f * 2.01, 0.12, 'sine', 0.02);
+}
+function sfxGemDone(n) { var f = 1200 / (1 + Math.sqrt(n) * 0.05); tone(f, 0.5, 'sine', 0.09); tone(f * 1.5, 0.5, 'sine', 0.05, { delay: 0.06 }); }
+function sfxChord(kind) {
+  if (time - sndT.chord < 0.25) return; sndT.chord = time;
+  var roots = [523.25, 587.33, 659.25, 698.46];
+  var r = roots[kind % 4];
+  var ch = [1, 1.25, 1.5, 2];
+  for (var k = 0; k < ch.length; k++) tone(r * ch[k], 1.3, 'sine', 0.06, { delay: k * 0.04, attack: 0.02 });
+}
+function sfxSuck() { tone(260, 0.45, 'sine', 0.1, { to: 900 }); noise(0.4, 0.04, 'bandpass', 600, { to: 2400, q: 2 }); }
+function sfxLaunch(T, big) {
+  tone(big ? 220 : 420, T, 'sine', big ? 0.07 : 0.05, { to: big ? 900 : 1500, attack: 0.1 });
+  noise(T, 0.03, 'bandpass', 800, { to: 3000, q: 3, attack: 0.1 });
+}
+function sfxBurst(power, gold) {
+  noise(0.9 + power * 0.8, 0.22 * power + 0.05, 'lowpass', 900 + power * 600, { to: 120, q: 0.7 });
+  tone(70 + 20 * (1 - power), 0.6 + power * 0.5, 'sine', 0.18 * power, { to: 40 });
+  var n = 4 + Math.round(power * 6);
+  for (var k = 0; k < n; k++) {
+    tone(PENTA[(Math.random() * PENTA.length) | 0] * (gold ? 2 : 1.5), 0.5, 'sine', 0.03, { delay: 0.12 + k * 0.07 + Math.random() * 0.05 });
+  }
+}
+function sfxCrackle(n) { for (var k = 0; k < n * 3; k++) noise(0.08, 0.06, 'highpass', 2000, { delay: k * 0.05 + Math.random() * 0.04 }); }
+function sfxRingHum(T) {
+  if (!ok()) return null;
+  try {
+    var t0 = AC.currentTime;
+    var o = AC.createOscillator(), o2 = AC.createOscillator(), g = AC.createGain(), f = AC.createBiquadFilter();
+    o.type = 'sawtooth'; o2.type = 'sine';
+    o.frequency.setValueAtTime(65, t0); o.frequency.exponentialRampToValueAtTime(180, t0 + T);
+    o2.frequency.setValueAtTime(130, t0); o2.frequency.exponentialRampToValueAtTime(360, t0 + T);
+    f.type = 'lowpass'; f.frequency.setValueAtTime(200, t0); f.frequency.exponentialRampToValueAtTime(1400, t0 + T);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.09, t0 + 0.4);
+    g.gain.setValueAtTime(0.09, t0 + T - 0.2); g.gain.exponentialRampToValueAtTime(0.0001, t0 + T);
+    o.connect(f); o2.connect(f); f.connect(g); g.connect(master);
+    o.start(t0); o2.start(t0); o.stop(t0 + T + 0.05); o2.stop(t0 + T + 0.05);
+  } catch (e) {}
+  return null;
+}
+function startDrawVoice() {
+  if (!ok() || drawV) return;
+  try {
+    var t0 = AC.currentTime;
+    var o = AC.createOscillator(), lfo = AC.createOscillator(), lg = AC.createGain(), g = AC.createGain();
+    o.type = 'sine'; o.frequency.value = 660;
+    lfo.frequency.value = 6.5; lg.gain.value = 0;
+    lfo.connect(lg); lg.connect(o.frequency);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.035, t0 + 0.06);
+    o.connect(g); g.connect(master);
+    o.start(t0); lfo.start(t0);
+    drawV = { o: o, lfo: lfo, lg: lg, g: g };
+  } catch (e) { drawV = null; }
+}
+function updateDrawVoice(curv) {
+  if (!drawV || !ok()) return;
+  try {
+    var t = AC.currentTime;
+    var c = clamp(curv, 0, 1.6);
+    drawV.o.frequency.setTargetAtTime(700 - c * 170, t, 0.06);
+    drawV.lg.gain.setTargetAtTime(c * 38, t, 0.08);
+    drawV.lfo.frequency.setTargetAtTime(5 + c * 5, t, 0.1);
+  } catch (e) {}
+}
+function stopDrawVoice() {
+  if (!drawV) return;
+  try {
+    var t = AC.currentTime;
+    drawV.g.gain.cancelScheduledValues(t);
+    drawV.g.gain.setTargetAtTime(0.0001, t, 0.04);
+    drawV.o.stop(t + 0.3); drawV.lfo.stop(t + 0.3);
+  } catch (e) {}
+  drawV = null;
+}
+
+/* ------------------------------ ループ ------------------------------ */
+function sparkle(x, y, col, n, spd) {
+  for (var q = 0; q < n; q++) {
+    var a = Math.random() * TAU, v = spd * rnd(0.4, 1);
+    spawnFX(x, y, Math.cos(a) * v, Math.sin(a) * v, Math.random() < 0.5 ? C_WHITE : col, rnd(0.4, 0.8), 1.6);
+  }
+}
+function update(dt) {
+  updateGuide(dt);
+  updateDemo(dt);
+  updateClouds(dt);
+  captureFrame(dt);
+  updateParticles(dt);
+  updateLines(dt);
+  updateGems(dt);
+  updateTube(dt);
+  updateShells(dt);
+  updateRings(dt);
+  updatePops(dt);
+  updateBrush(dt);
+}
+var running = false, rafId = 0, lastTs = 0;
+function frame(ts) {
+  if (!running) return;
+  rafId = requestAnimationFrame(frame);
+  var dt = lastTs ? (ts - lastTs) / 1000 : 0.016;
+  lastTs = ts;
+  if (!(dt > 0)) dt = 0.016;
+  if (dt > 0.034) dt = 0.034;
+  time += dt;
+  update(dt);
+  render();
+}
+function start() {
+  if (running) return;
+  running = true; lastTs = 0;
+  rafId = requestAnimationFrame(frame);
+}
+function stop() {
+  running = false;
+  if (rafId) cancelAnimationFrame(rafId);
+  rafId = 0;
+  if (activePointer !== null) { activePointer = null; endTouch(); }
+}
+document.addEventListener('visibilitychange', function () {
+  if (document.hidden) { stop(); try { if (AC && AC.state === 'running') AC.suspend(); } catch (e) {} }
+  else { start(); try { if (AC && AC.state === 'suspended') AC.resume().catch(function () {}); } catch (e) {} }
+});
+var resizeT = 0;
+window.addEventListener('resize', function () { clearTimeout(resizeT); resizeT = setTimeout(resize, 60); });
+window.addEventListener('orientationchange', function () { setTimeout(resize, 200); });
+
+resize();
+setupPalette();
+brush.x = brush.restX; brush.y = brush.restY;
+initClouds();
+guide.t = 0; updateGuide(0);
+start();
+
+// 自動検査用の読み取り口（画面には何も出さない）
+window.__gf = {
+  stats: stats,
+  forceGold: function (k) { k = k || 0; relocateCloud(k); clouds[k].gold = true; clouds[k].col = C_GOLD; clouds[k].tc = 70; clouds[k].rad = Math.min(W, H) * 0.09 + 12; },
+  snapshot: function () {
+    var c = {}; for (var i = 0; i < MAXP; i++) if (st[i]) c[st[i]] = (c[st[i]] || 0) + 1;
+    return {
+      alive: alive, states: c, lines: lines.length, gems: gems.map(function (g) { return { x: g.x, y: g.y, total: g.total, state: g.state, cls: g.cls, gold: g.gold, emberN: g.emberN, avg: [g.ar | 0, g.ag | 0, g.ab | 0] }; }),
+      rings: rings.length, shells: shells.length, tube: { n: tube.n, x: tube.x, mouthY: tube.mouthY, bottom: tube.bottom, w: tube.w, memory: tube.memory },
+      clouds: clouds.map(function (c) { return { x: c.x, y: c.y, rad: c.rad, count: c.count, col: c.col, gold: c.gold }; }),
+      embers: emberCount, emberPts: (function () { var r = []; for (var i = 0; i < MAXP; i++) if (st[i] === S_FREE && (fl[i] & F_EMBER)) r.push([px[i] | 0, py[i] | 0]); return r; })(), guide: guide.type, demo: !!demo, demoDone: demoDone, W: W, H: H, running: running,
+      brush: { x: brush.x, y: brush.y }, linesInfo: lines.map(function (L) { return { len: L.len, endType: L.endType, corners: L.corners.length, captured: L.captured }; })
+    };
+  }
+};
+})();
+</script>
+</body>
+</html>
