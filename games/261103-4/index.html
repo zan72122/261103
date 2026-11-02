@@ -712,7 +712,7 @@ function completeHanky(){
   // 次の白布
   S.hanky=newHanky();S.fold=null;S.f=0;S.spr.x=0;S.spr.v=0;S.arrive=1;S.printSeed++;S.revAcc=0;
   for(const l of S.layers)clampLayer(l);
-  for(const l of S.layers){if(l.kind==='lace'){S.laceUses++;l.snagAt=(S.laceUses>1&&Math.random()<.4)?.12+Math.random()*.2:null}}
+  for(const l of S.layers){if(l.kind==='lace'){S.laceUses++;l.snagAt=(S.laceUses>1&&Math.random()<.25)?.12+Math.random()*.2:null}}
   if(S.hand.mode!=='rest'&&S.hand.mode!=='show'){S.hand.mode='rest'}
   S.hand.mode='show';S.hand.t=0;
 }
@@ -799,7 +799,7 @@ function startWork(x,y){
     S.wheel.held=true;S.wheel.press=1;S.squeeze=1;SFX.press();logEv('wheelDown',{});
     return;
   }
-  for(const b of LY.bins){if(inRect(x,y,b,4)){act.type='fabric';act.kind=b.kind;S.drag={kind:'fabric',fk:b.kind,x,y,s:LY.L*.92,ts:b.w*.8};SFX.pick();S.wiggles['bin:'+b.kind]=.6;return}}
+  for(const b of LY.bins){if(inRect(x,y,b,0)){act.type='fabric';act.kind=b.kind;S.drag={kind:'fabric',fk:b.kind,x,y,s:LY.L*.92,ts:b.w*.8};SFX.pick();S.wiggles['bin:'+b.kind]=.6;return}}
   // 重ねた布
   for(let i=S.layers.length-1;i>=0;i--){
     const l=S.layers[i],r=layerRect(l);const vis={x:r.x,y:r.y,w:r.w,h:Math.min(r.h,LY.nipY-LY.rr-r.y)};
@@ -951,7 +951,7 @@ function addLayer(l,x,y){
   clampLayer(l);
   if(S.layers.length>=3){const b=S.layers.shift();returnLayerHome(b,layerRect(b))}
   if(l.kind==='lace'&&l.snagAt===undefined)l.snagAt=null;
-  if(l.kind==='lace'){l.snagAt=(S.laceUses>=1&&Math.random()<.4)?.12+Math.random()*.2:null}
+  if(l.kind==='lace'){l.snagAt=(S.laceUses>=1&&Math.random()<.25)?.12+Math.random()*.2:null}
   S.layers.push(l);S.drag=null;SFX.drop();
   logEv('layerAdd',{kind:l.kind,f:+S.f.toFixed(3),ox:+l.ox.toFixed(2),oy:+l.oy.toFixed(2),stack:layerSig()});
 }
