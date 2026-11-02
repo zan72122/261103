@@ -241,7 +241,7 @@ function computeLight(){
   blur(gCnt,gw,gh);blur(gSt,gw,gh);
   const n0=d.n0,st=G.stats;st.grains=0;st.bright=0;st.shadow=0;st.bminx=1e9;st.bmaxx=-1e9;st.bminy=1e9;st.bmaxy=-1e9;st.bsumx=0;st.bsumy=0;
   st.floorN=0;st.floorX=0;st.floorY=0;st.cellsLit=0;st.allminx=1e9;st.allmaxx=-1e9;st.allminy=1e9;st.allmaxy=-1e9;
-  const pl=L.plates;st.plate=[0,0];st.plateNear=[0,0];st.corner=[0,0];
+  const pl=L.plates;st.plate=[0,0];st.plateNear=[0,0];st.plateC=[0,0];st.nearC=[0,0];st.corner=[0,0];
   const fl=L.floorY,cz=L.sw*(L.P?0.09:0.1),cY=fl+(H-fl)*0.15;
   nG=0;nB=0;bSum=0;nC=0;
   // pass 1: transmission per cell + budget so caps thin evenly instead of truncating by scan order
@@ -258,6 +258,7 @@ function computeLight(){
     const AX=ix+gix0,AY=iy+giy0,lx=(AX+0.5)*CS,ly=(AY+0.5)*CS;
     const Cx=M.ox+lx*M.s,Cy=M.oy+ly*M.s,Px=sx+(Cx-sx)*kx,Py=sy+(Cy-sy)*k,cp=CS*M.s*k;
     st.cellsLit++;
+    if(T>0.3)for(let p=0;p<2;p++){const q=pl[p],dx=(Px-q.x)/q.rx,dy=(Py-q.y)/(q.ry*2.6),r2=dx*dx+dy*dy;if(r2<1)st.plateC[p]+=T;else if(r2<3.6)st.nearC[p]+=T;}
     if(T>0.22&&nC<MAXC&&(fC>=1||hash2(AX+7,AY+3)<fC)&&Px>-cp&&Py>-cp&&Px<W+cp&&Py<H+cp){cPX[nC]=Px;cPY[nC]=Py;cPS[nC]=cp*2.4*Math.max(1,kx/k);cPA[nC]=Math.min(0.17,T*0.2);nC++;}
     if(T>0.3&&nB<MAXB&&(fB>=1||hash2(AX+5,AY+9)<fB)){bCX[nB]=Cx;bCY[nB]=Cy;bPX[nB]=Px;bPY[nB]=Py;bT[nB]=T;bSum+=T;nB++;}
     const g=T*Math.sqrt(T)*5.2*fG,gi=Math.floor(g),ng=gi+(hash2(AX,AY)<g-gi?1:0);
@@ -267,7 +268,7 @@ function computeLight(){
       grX[nG]=x;grY[nG]=y;grS[nG]=clamp(cp*(0.16+0.42*T),2.4,20);grA[nG]=0.2+0.8*T;grP[nG]=u*TAU;nG++;st.grains++;
       if(x<st.allminx)st.allminx=x;if(x>st.allmaxx)st.allmaxx=x;if(y<st.allminy)st.allminy=y;if(y>st.allmaxy)st.allmaxy=y;
       if(T>0.3){st.bright++;st.bsumx+=x;st.bsumy+=y;if(x<st.bminx)st.bminx=x;if(x>st.bmaxx)st.bmaxx=x;if(y<st.bminy)st.bminy=y;if(y>st.bmaxy)st.bmaxy=y;
-        for(let p=0;p<2;p++){if(inPlate(pl[p],x,y,2.6))st.plate[p]++;else if(inPlate(pl[p],x,y*1,7))st.plateNear[p]++;}
+        for(let p=0;p<2;p++){if(inPlate(pl[p],x,y,2.6))st.plate[p]++;else{const q=pl[p],dx=(x-q.x)/(q.rx*2.4),dy=(y-q.y)/(q.ry*2.6*2.4);if(dx*dx+dy*dy<1)st.plateNear[p]++;}}
         if(y>fl){st.floorN++;st.floorX+=x;st.floorY+=y;}
         if(y>cY){if(x<L.sx+cz)st.corner[0]++;else if(x>L.sx+L.sw-cz)st.corner[1]++;}}
     }
@@ -275,7 +276,7 @@ function computeLight(){
   // hole beams count as strong light
   st.holeOpen=0;
   for(const ho of d.holes){if(ho.cov)continue;st.holeOpen++;const Cx=M.ox+ho.x*M.s,Cy=M.oy+ho.y*M.s,Px=sx+(Cx-sx)*kx,Py=sy+(Cy-sy)*k;ho.sx=Cx;ho.sy=Cy;ho.px=Px;ho.py=Py;
-    for(let p=0;p<2;p++)if(inPlate(pl[p],Px,Py,3))st.plate[p]+=6;
+    for(let p=0;p<2;p++)if(inPlate(pl[p],Px,Py,3)){st.plate[p]+=6;st.plateC[p]+=1.5;}
     if(Py>fl){st.floorN+=4;st.floorX+=Px*4;st.floorY+=Py*4;}
     if(Py>cY){if(Px<L.sx+cz)st.corner[0]+=6;else if(Px>L.sx+L.sw-cz)st.corner[1]+=6;}}
 }
@@ -342,7 +343,7 @@ function toLocal(x,y){const M=G.map;return {x:(x-M.ox)/M.s,y:(y-M.oy)/M.s};}
 function handleScreen(h){const p=toScreen(cur.hdx[h],cur.hdy[h]);const sq=cur.nOut(h);const off=0.05*G.map.s;if(!cur.fold[h]){p.x+=sq[0]*off;p.y+=sq[1]*off;}return p;}
 function winMap(fit,win){const s=fit.s*win.h;return {ox:win.x+win.w/2-fit.cx*s,oy:win.y+win.h/2-fit.cy*s,s};}
 function lampMap(){let ox=L.dc.x+G.carry.x,oy=L.dc.y+G.carry.y,s=L.R;if(G.mode==='renew'){const e=ease(G.tt/1.2);ox=lerp(L.nd.x,ox,e);oy=lerp(L.nd.y,oy,e);s=lerp(L.nd.r*0.9,s,e);}return {ox,oy,s};}
-function lampK(){return lerp(1.6,3.0,G.lz);}
+function lampK(){return lerp(1.35,3.0,G.lz);}
 const SUNK=1.1;
 function sunPos(){const w=L.win,wcy=w.y+w.h/2,ty=lerp(L.floorY,H,0.3);return {x:w.x+w.w*(L.P?0.4:0.35),y:wcy-(ty-wcy)/(SUNK-1)};}
 function sunK(){return SUNK;}
@@ -381,8 +382,8 @@ let lastCov=new Map();
 function coverCheck(){for(const ho of cur.holes){const pv=lastCov.get(ho);if(pv!==undefined&&pv!==ho.cov){if(ho.cov){SND.cover();G.flags.holeCover=true;}else SND.unfold();}lastCov.set(ho,ho.cov);}}
 function updatePlates(dt){const st=G.stats;
   for(let p=0;p<2;p++){const ps=G.plates[p]||(G.plates[p]={lit:0,on:false,t:0,fit:false,wob:0,wv:0,glow:0});
-    const on=st.plate[p]>=4;ps.lit=st.plate[p];ps.t=on?ps.t+dt:0;
-    const fit=on&&st.plateNear[p]<=Math.max(2,st.plate[p]*0.35);
+    const on=st.plate[p]>=4||st.plateC[p]>=0.6;ps.lit=st.plate[p];ps.t=on?ps.t+dt:0;
+    const spill=(G.k<=1.9?3.5:1.6)*(ps.fit?1.2:1),fit=on&&G.mode==='lamp'&&st.plateC[p]>=0.5&&st.nearC[p]<=st.plateC[p]*spill;
     if(ps.t>0.25&&!ps.on){ps.on=true;const pl=L.plates[p];SND.success('plate');burst(pl.x,pl.y,14,110,1,2.4);react('thumb',pl.x,pl.y);G.flags.plate=true;}
     if(!on&&ps.on){ps.off=(ps.off||0)+dt;if(ps.off>0.8){ps.on=false;ps.off=0;}}else ps.off=0;
     if(fit&&!ps.fit&&ps.on){const pl=L.plates[p];for(let i=0;i<10;i++){const a=i/10*TAU;dust(pl.x+Math.cos(a)*pl.rx,pl.y+Math.sin(a)*pl.ry*2,Math.cos(a)*30,Math.sin(a)*30-20,0.9,2.6,1,0);}tone(1568,0.3,'triangle',0.08);}
