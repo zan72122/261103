@@ -87,8 +87,8 @@ class Dough{
   }
   nOut(h){const x=this.hrx[h]+this.P[2*h],y=this.hry[h]+this.P[2*h+1],l=Math.hypot(x,y)||1;return [x/l,y/l];}
   addHole(rx,ry,r,h){
-    const o={w:0,gx:0,gy:0},ws=new Float32Array(NH);for(let g=0;g<NH;g++){weightAt(g,rx,ry,o);ws[g]=o.w;}
-    const hole={rx,ry,r,h,ws,x:rx,y:ry,cov:false,cn:0};this.holes.push(hole);
+    const o={w:0,gx:0,gy:0},ws=new Float32Array(NH),wgx=new Float32Array(NH),wgy=new Float32Array(NH);for(let g=0;g<NH;g++){weightAt(g,rx,ry,o);ws[g]=o.w;wgx[g]=o.gx;wgy[g]=o.gy;}
+    const hole={rx,ry,r,h,ws,wgx,wgy,x:rx,y:ry,rd:r,cov:false,cn:0};this.holes.push(hole);
     for(let i=0;i<this.N;i++){const dx=this.rx[i]-rx,dy=this.ry[i]-ry;if(dx*dx+dy*dy<r*r)this.hid[i]=1;}
     return hole;
   }
@@ -126,11 +126,12 @@ class Dough{
     if(mnx>mxx){mnx=-1;mxx=1;mny=-1;mxy=1;}
     this.minx=mnx;this.maxx=mxx;this.miny=mny;this.maxy=mxy;
     for(let h=0;h<NH;h++){let x=this.h0x[h],y=this.h0y[h],lay=0;for(let k=0;k<nf;k++){const s=(x-fmx[k])*fux[k]+(y-fmy[k])*fuy[k];if(s>0){x-=2*s*fux[k];y-=2*s*fuy[k];lay++;}}this.hdx[h]=x;this.hdy[h]=y;this.hlay[h]=lay;}
-    for(const ho of this.holes){let x=ho.rx,y=ho.ry;for(let g=0;g<NH;g++){x+=ho.ws[g]*D[2*g];y+=ho.ws[g]*D[2*g+1];}
-      for(let k=0;k<nf;k++){const s=(x-fmx[k])*fux[k]+(y-fmy[k])*fuy[k];if(s>0){x-=2*s*fux[k];y-=2*s*fuy[k];}}ho.x=x;ho.y=y;
+    for(const ho of this.holes){let x=ho.rx,y=ho.ry,a=1,b=0,c=0,dd=1;for(let g=0;g<NH;g++){const dx=D[2*g],dy=D[2*g+1];x+=ho.ws[g]*dx;y+=ho.ws[g]*dy;a+=dx*ho.wgx[g];b+=dx*ho.wgy[g];c+=dy*ho.wgx[g];dd+=dy*ho.wgy[g];}
+      ho.rd=ho.r*clamp(Math.sqrt(Math.abs(a*dd-b*c)),1,3);
+      let hl=0;for(let k=0;k<nf;k++){const s=(x-fmx[k])*fux[k]+(y-fmy[k])*fuy[k];if(s>0){x-=2*s*fux[k];y-=2*s*fuy[k];hl++;}}ho.x=x;ho.y=y;ho.lay=hl;
       // covered by other layers?
-      let cn=0;const rr=ho.r*1.0,rr2=rr*rr,ex2=(ho.r*1.9)*(ho.r*1.9);
-      for(let i=0;i<N;i++){if(this.hid[i])continue;const dx=this.px[i]-x,dy=this.py[i]-y;if(dx*dx+dy*dy<rr2){const qx=this.rx[i]-ho.rx,qy=this.ry[i]-ho.ry;if(qx*qx+qy*qy>ex2)cn++;}}
+      let cn=0;const rr=ho.rd*0.9,rr2=rr*rr,ex2=(ho.r*1.9)*(ho.r*1.9);
+      for(let i=0;i<N;i++){if(this.hid[i])continue;const dx=this.px[i]-x,dy=this.py[i]-y;if(dx*dx+dy*dy<rr2){const qx=this.rx[i]-ho.rx,qy=this.ry[i]-ho.ry;if(this.pl[i]!==hl||qx*qx+qy*qy>ex2)cn++;}}
       ho.cn=cn;ho.cov=cn>=2;}
   }
 }
@@ -243,17 +244,23 @@ function computeLight(){
   const pl=L.plates;st.plate=[0,0];st.plateNear=[0,0];st.corner=[0,0];
   const fl=L.floorY,cz=L.sw*(L.P?0.09:0.1),cY=fl+(H-fl)*0.15;
   nG=0;nB=0;bSum=0;nC=0;
+  // pass 1: transmission per cell + budget so caps thin evenly instead of truncating by scan order
+  let sumG=0,cntC=0,cntB=0,thS=0,thW=0;
+  for(let j=0;j<n;j++){const c=gCnt[j];if(c<0.22){gTmp[j]=-1;continue;}const th=Math.max(c/n0,gSt[j]/c);gTmp[j]=th;thS+=th*c;thW+=c;}
+  // morning sun: thickness judged relative to the whole sheet so the thinnest (latest pulled) part becomes the light road
+  const we=G.mode==='window'?1:G.mode==='hang'?ease(G.tt/1.1):0,thM=thW>0?thS/thW:1,thK=lerp(1,Math.max(1,0.62/Math.max(0.15,thM)),we);
+  for(let j=0;j<n;j++){if(gTmp[j]<0){gT[j]=0;continue;}const c=gCnt[j],th=gTmp[j]*thK;const T=Tf(th);gT[j]=T;
+    if(th>1.15&&c>0.8)st.shadow++;if(T>=0.02)sumG+=T*Math.sqrt(T)*5.2;if(T>0.22)cntC++;if(T>0.3)cntB++;}
+  const fG=sumG>MAXG*0.97?MAXG*0.97/sumG:1,fC=cntC>MAXC?MAXC/cntC:1,fB=cntB>MAXB?MAXB/cntB:1;
   for(let iy=0;iy<gh;iy++)for(let ix=0;ix<gw;ix++){
-    const j=iy*gw+ix,c=gCnt[j];if(c<0.22){gT[j]=0;continue;}
-    const th=Math.max(c/n0,gSt[j]/c);const T=Tf(th);gT[j]=T;
-    if(th>1.15&&c>0.8)st.shadow++;
+    const j=iy*gw+ix,T=gT[j];
     if(T<0.02)continue;
     const AX=ix+gix0,AY=iy+giy0,lx=(AX+0.5)*CS,ly=(AY+0.5)*CS;
     const Cx=M.ox+lx*M.s,Cy=M.oy+ly*M.s,Px=sx+(Cx-sx)*kx,Py=sy+(Cy-sy)*k,cp=CS*M.s*k;
     st.cellsLit++;
-    if(T>0.22&&nC<MAXC&&Px>-cp&&Py>-cp&&Px<W+cp&&Py<H+cp){cPX[nC]=Px;cPY[nC]=Py;cPS[nC]=cp*2.4*Math.max(1,kx/k);cPA[nC]=Math.min(0.17,T*0.2);nC++;}
-    if(T>0.3&&nB<MAXB){bCX[nB]=Cx;bCY[nB]=Cy;bPX[nB]=Px;bPY[nB]=Py;bT[nB]=T;bSum+=T;nB++;}
-    const g=T*Math.sqrt(T)*5.2,gi=Math.floor(g),ng=gi+(hash2(AX,AY)<g-gi?1:0);
+    if(T>0.22&&nC<MAXC&&(fC>=1||hash2(AX+7,AY+3)<fC)&&Px>-cp&&Py>-cp&&Px<W+cp&&Py<H+cp){cPX[nC]=Px;cPY[nC]=Py;cPS[nC]=cp*2.4*Math.max(1,kx/k);cPA[nC]=Math.min(0.17,T*0.2);nC++;}
+    if(T>0.3&&nB<MAXB&&(fB>=1||hash2(AX+5,AY+9)<fB)){bCX[nB]=Cx;bCY[nB]=Cy;bPX[nB]=Px;bPY[nB]=Py;bT[nB]=T;bSum+=T;nB++;}
+    const g=T*Math.sqrt(T)*5.2*fG,gi=Math.floor(g),ng=gi+(hash2(AX,AY)<g-gi?1:0);
     for(let q=0;q<ng&&nG<MAXG;q++){
       const u=hash2(AX*3+q*17+1,AY*5+q*31+7),v=hash2(AX*11+q*7+3,AY*13+q*3+11);
       const x=Px+(u-0.5)*cp*kx/k,y=Py+(v-0.5)*cp;if(x<-20||y<-20||x>W+20||y>H+20)continue;
@@ -357,14 +364,16 @@ function updateMap(){
 
 /* ===== events: holes, plates, corners ===== */
 function holeCheck(h){
-  const d=cur;if(d.hc[h]>=2||d.holes.length>=6)return;
-  const m=Math.hypot(d.P[2*h]+d.ET[2*h],d.P[2*h+1]+d.ET[2*h+1]);const thr=(HDEF[h].side?1.6:1.35)+d.hc[h]*0.4;
+  const d=cur;if(d.hc[h]>=2||d.holes.length>=6||ptr.holed)return;
+  if(Math.hypot(d.ET[2*h],d.ET[2*h+1])<0.3)return;
+  const m=Math.hypot(d.P[2*h]+d.ET[2*h],d.P[2*h+1]+d.ET[2*h+1]);const thr=(HDEF[h].side?1.6:1.35)+d.hc[h]*0.4+(G.mode==='window'?0.25:0);
   if(m<thr)return;
   // most stretched particle in this handle's zone, away from existing holes
   let bi=-1,bt=1e9;for(let i=0;i<d.N;i++){if(d.hid[i])continue;const w=d.W[i*NH+h];if(w<0.12||w>0.62)continue;let ok=true;for(const ho of d.holes){const dx=d.rx[i]-ho.rx,dy=d.ry[i]-ho.ry;if(dx*dx+dy*dy<0.1){ok=false;break;}}
-    if(!ok)continue;const r2=d.rx[i]*d.rx[i]+d.ry[i]*d.ry[i];if(r2>0.8)continue;if(d.pt[i]<bt){bt=d.pt[i];bi=i;}}
+    if(!ok)continue;const r2=d.rx[i]*d.rx[i]+d.ry[i]*d.ry[i];if(r2>0.8)continue;
+    {const a=HDEF[h].a,perp=Math.abs(-d.rx[i]*Math.sin(a)+d.ry[i]*Math.cos(a));if(perp>0.2)continue;}if(d.pt[i]<bt){bt=d.pt[i];bi=i;}}
   if(bi<0)return;
-  d.hc[h]++;const ho=d.addHole(d.rx[bi],d.ry[bi],0.12,h);d.compute();
+  d.hc[h]++;ptr.holed=true;const ho=d.addHole(d.rx[bi],d.ry[bi],0.12,h);d.compute();
   const p=toScreen(ho.x,ho.y);burst(p.x,p.y,16,140,1,2.4);burst(p.x,p.y,8,90,0,2);SND.pop();
   G.flags.hole=true;react('startle',p.x,p.y);saveSoon();
 }
@@ -404,7 +413,7 @@ function pointAt(hand,T,reach,pose,stiff){const A=anchorFor(T);let dx=T.x-A.x,dy
 function homePos(){return {x:L.sx+L.sw*(L.P?0.17:0.09),y:L.sy+L.sh*(L.P?0.93:0.9)};}
 function startDemo(t){const P0=targetPoint(t);if(!P0)return;const s=G.map.s;let E={x:P0.x,y:P0.y};
   if(t.kind==='h'||t.kind==='hole'){const n=cur.nOut(t.h);E={x:P0.x+n[0]*0.6*s,y:P0.y+n[1]*0.6*s};}
-  else if(t.kind==='fold'){const n=cur.nOut(t.h);E={x:P0.x-n[0]*0.85*s,y:P0.y-n[1]*0.85*s};}
+  else if(t.kind==='fold'){const c=toScreen((cur.minx+cur.maxx)/2,(cur.miny+cur.maxy)/2);E={x:lerp(P0.x,c.x,0.9),y:lerp(P0.y,c.y,0.9)};}
   else if(t.kind==='lamp'){E={x:P0.x+(G.lx>0?-1:1)*0.9*L.R,y:P0.y-0.25*(L.lampFront-L.lampBack)};}
   else if(t.kind==='win'){const c=toScreen((cur.minx+cur.maxx)/2,(cur.miny+cur.maxy)/2);HD.demo={t:0,k:t.kind,h:-1,S:c,E:{x:L.win.x+L.win.w/2,y:L.win.y+L.win.h/2}};return;}
   HD.demo={t:0,k:t.kind,h:t.h!==undefined?t.h:-1,S:P0,E};}
@@ -458,7 +467,7 @@ function onDown(e){
   // morning: new dough
   if(G.mode==='window'&&Math.hypot(x-L.nd.x,y-L.nd.y)<Math.max(36,L.nd.r*1.6)){newRound();return;}
   if(hh.d<hr||(hh.d<hr*1.25&&insideDough(x,y,0.22))){
-    const h=hh.h,d=cur;grab('handle');ptr.h=h;const lp=toLocal(x,y);ptr.lx0=lp.x;ptr.ly0=lp.y;ptr.qx0=d.hdx[h];ptr.qy0=d.hdy[h];ptr.hadFold=!!d.fold[h];ptr.mode=d.fold[h]?'fold':'stretch';
+    const h=hh.h,d=cur;grab('handle');ptr.h=h;ptr.holed=false;const lp=toLocal(x,y);ptr.lx0=lp.x;ptr.ly0=lp.y;ptr.qx0=d.hdx[h];ptr.qy0=d.hdy[h];ptr.hadFold=!!d.fold[h];ptr.mode=d.fold[h]?'fold':'stretch';
     d.sq[h]=0.45;d.sqv[h]=0;SND.squish();
     if(!d.fold[h]){const n=d.nOut(h);const tp=0.26;d.P[2*h]+=n[0]*tp;d.P[2*h+1]+=n[1]*tp;d.E[2*h]+=n[0]*0.3;d.E[2*h+1]+=n[1]*0.3;d.EV[2*h]=0;d.EV[2*h+1]=0;
       d.compute();updateFlagsFor(h);holeCheck(h);}
@@ -486,7 +495,7 @@ function onMove(e){
     let qx=ptr.qx0+(lp.x-ptr.lx0),qy=ptr.qy0+(lp.y-ptr.ly0);
     const n=d.nOut(h),bx=d.hbx[h],by=d.hby[h];const inward=(qx-bx)*n[0]+(qy-by)*n[1];
     const f=d.fold[h];
-    if(f&&!f.dying){if(inward>(ptr.hadFold?-0.35:-0.06)){d.fold[h]=null;ptr.mode='stretch';SND.unfold();G.flags.unfold=true;}else{f.gx=qx;f.gy=qy;d.ET[2*h]=0;d.ET[2*h+1]=0;}}
+    if(f&&!f.dying){if(inward>(ptr.hadFold?-0.5:-0.06)){d.fold[h]=null;ptr.mode='stretch';SND.unfold();G.flags.unfold=true;}else{f.gx=qx;f.gy=qy;d.ET[2*h]=0;d.ET[2*h+1]=0;}}
     else if(inward<-0.1){if(f&&f.dying){f.dying=false;}else{d.fold[h]={h,tx:bx,ty:by,gx:qx,gy:qy,vx:0,vy:0,ord:++d.foldOrd,dying:false};}d.fold[h].gx=qx;d.fold[h].gy=qy;ptr.mode='fold';d.ET[2*h]=0;d.ET[2*h+1]=0;}
     if(ptr.mode==='stretch'&&!d.fold[h]){let ex=qx-bx,ey=qy-by;const px=d.P[2*h],py=d.P[2*h+1];let tx=px+ex,ty=py+ey;const tm=Math.hypot(tx,ty);
       const lim=G.mode==='window'?2.0:1.7;if(tm>lim){const nm=lim+Math.min(0.55,(tm-lim)*0.4);tx*=nm/tm;ty*=nm/tm;}ex=tx-px;ey=ty-py;d.ET[2*h]=ex;d.ET[2*h+1]=ey;holeCheck(h);}
@@ -504,7 +513,7 @@ function onUp(e){
     if(ptr.mode==='stretch'||!d.fold[h]){const ex=d.ET[2*h],ey=d.ET[2*h+1];d.P[2*h]+=ex*0.7;d.P[2*h+1]+=ey*0.7;d.E[2*h]-=ex*0.7;d.E[2*h+1]-=ey*0.7;d.ET[2*h]=0;d.ET[2*h+1]=0;
       const pm=Math.hypot(d.P[2*h],d.P[2*h+1]),pl=G.mode==='window'?2.4:2.1;if(pm>pl){d.P[2*h]*=pl/pm;d.P[2*h+1]*=pl/pm;}
       updateFlagsFor(h);if(G.mode==='window'&&Math.hypot(ex,ey)>0.08){G.flags.mPull=true;G.mPulls++;}}
-    else{const f=d.fold[h];const depth=Math.hypot(d.hbx[h]-f.gx,d.hby[h]-f.gy);if(depth<0.45){f.dying=true;if(ptr.hadFold){G.flags.unfold=true;}}else{f.dying=false;G.flags.fold=true;SND.fold();const p=handleScreen(h);burst(p.x,p.y,12,70,0,2.2);}}
+    else{const f=d.fold[h];const depth=Math.hypot(d.hbx[h]-f.gx,d.hby[h]-f.gy);if(depth<0.6){f.dying=true;if(ptr.hadFold){G.flags.unfold=true;}}else{f.dying=false;G.flags.fold=true;SND.fold();const p=handleScreen(h);burst(p.x,p.y,12,70,0,2.2);}}
     if(G.mode==='window'){G.flags.mPull=G.flags.mPull||ptr.mode==='fold';}
   }else if(ptr.kind==='carry'){const w=L.win;const cx=L.dc.x+G.carry.x,cy=L.dc.y+G.carry.y;
     const near=(ptr.fx>w.x-L.sw*0.12&&ptr.fx<w.x+w.w+L.sw*0.12&&ptr.fy>w.y-L.sh*0.05&&ptr.fy<w.y+w.h+L.sh*0.08)||Math.hypot(cx-(w.x+w.w/2),cy-(w.y+w.h/2))<Math.max(w.w,w.h)*0.75;
@@ -609,7 +618,7 @@ function drawDough(d,M,glow,alpha,stepI){
   if(glow){ctx.globalCompositeOperation='lighter';ctx.fillStyle=C_AMB;
     for(let i=0;i<d.N;i++){if(d.hid[i])continue;const T=cellT(d.px[i],d.py[i]);if(T<0.07)continue;const x=ox+d.px[i]*s,y=oy+d.py[i]*s,q=ds*1.25;ctx.globalAlpha=Math.min(1,T*1.15);ctx.fillRect(x-q/2,y-q/2,q,q);}
     // hole rims
-    for(const ho of d.holes){const cx=ox+ho.x*s,cy=oy+ho.y*s,rr=ho.r*s;ctx.globalAlpha=ho.cov?0.15:0.55+0.3*Math.sin(G.time*8);for(let k=0;k<10;k++){const a=k/10*TAU+G.time;ctx.fillRect(cx+Math.cos(a)*rr-1,cy+Math.sin(a)*rr-1,2.2,2.2);}}
+    for(const ho of d.holes){const cx=ox+ho.x*s,cy=oy+ho.y*s,rr=ho.rd*s;ctx.globalAlpha=ho.cov?0.15:0.55+0.3*Math.sin(G.time*8);for(let k=0;k<10;k++){const a=k/10*TAU+G.time;ctx.fillRect(cx+Math.cos(a)*rr-1,cy+Math.sin(a)*rr-1,2.2,2.2);}}
     ctx.globalCompositeOperation='source-over';}
 }
 function drawNubs(){
