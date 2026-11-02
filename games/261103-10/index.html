@@ -361,7 +361,7 @@ const windmill={a:0,w:0.25,glow:0};
 const towers=[];const flyBlocks=[];
 const lamps=[0,0,0,0,0,0];let signalFlash=0;
 const timeline=[];function later(dt,fn){timeline.push({t:T+dt,fn});}
-const LOG=[];function log(type,data){LOG.push(Object.assign({t:+T.toFixed(2),type},data||{}));if(LOG.length>400)LOG.shift();}
+const LOG=[];function log(type,data){LOG.push(Object.assign({t:+T.toFixed(2),type},data||{}));if(LOG.length>3000)LOG.shift();}
 let vid=0;
 
 function makeCrate(part,slot,drop){return {part,slot,x:SLOTS[slot][0],z:SLOTS[slot][1],state:'closed',sq:0,sqv:0,lidA:-0.27,lidU:0,lidv:0,py:0,pyv:0,taken:false,
