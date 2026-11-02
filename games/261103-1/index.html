@@ -2,1513 +2,922 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="mobile-web-app-capable" content="yes">
 <meta name="format-detection" content="telephone=no">
 <title>チョキチョキ！もじゃもじゃ床屋と積み木のおうち</title>
 <style>
-html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#6c8095;
+html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#6f8293;
   touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;
-  overscroll-behavior:none;-webkit-tap-highlight-color:transparent;}
-canvas{position:fixed;left:0;top:0;width:100%;height:100%;display:block;touch-action:none;outline:none;}
-#sa{position:fixed;left:0;top:0;width:0;height:0;visibility:hidden;pointer-events:none;
-  padding-top:env(safe-area-inset-top);padding-right:env(safe-area-inset-right);
-  padding-bottom:env(safe-area-inset-bottom);padding-left:env(safe-area-inset-left);}
+  overscroll-behavior:none;-webkit-tap-highlight-color:transparent}
+canvas{display:block;position:fixed;left:0;top:0;width:100%;height:100%;touch-action:none;
+  -webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+#safe{position:fixed;left:0;top:0;width:0;height:0;visibility:hidden;pointer-events:none;
+  padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
-<div id="sa"></div>
+<div id="safe"></div>
 <script>
-(function(){
 'use strict';
+(function(){
 /* ============================================================
    チョキチョキ！もじゃもじゃ床屋と積み木のおうち
-   核: 髪やひげを横スワイプで切る → 切れ端の角材が落ちて家の材料になる
+   髪やひげを横に切る → 切れ端の角材が落ちて家の材料になる
    ============================================================ */
-const cv = document.getElementById('c');
-const ctx = cv.getContext('2d', { alpha: false });
-const saEl = document.getElementById('sa');
+const cv=document.getElementById('c');
+const ctx=cv.getContext('2d',{alpha:false});
 
-let W = 0, H = 0, DPR = 1, K = 1, LW = 390, LH = 840;
-const SA = { t: 0, r: 0, b: 0, l: 0 };
-const L = { ox: 0, oy: 0, base: 780, headTop: 112, horizon: 412, mirrorX: 147 };
-
-const V = 20;            // 髪ボクセル
-const CELL = 36;         // 家の積み木1マス
-const COLS = 7;
-const MAXR = 10;
-const ROWLIM = 9;        // これより上は載らずに転がり落ちる
-const DEP = 18;          // 積み木の奥行き
-const HDEP = 11;         // 髪ボクセルの奥行き
-const GAP = 64;
-const SPACING = COLS * CELL + GAP;
-const DOORC = 3;
-const SLOTS = [1, 5];    // 窓の候補列
-const MAXPART = 90;
-const MAXRUBBLE = 36;
-
-/* ---------- 色 (1面1色・光源は左上) ---------- */
-function shade(hex, f) {
-  const n = parseInt(hex.slice(1), 16);
-  let r = n >> 16, g = (n >> 8) & 255, b = n & 255;
-  if (f > 0) { r += (255 - r) * f; g += (255 - g) * f; b += (255 - b) * f; }
-  else { r *= 1 + f; g *= 1 + f; b *= 1 + f; }
-  return 'rgb(' + (r | 0) + ',' + (g | 0) + ',' + (b | 0) + ')';
-}
-function pal(hex) { return { f: hex, t: shade(hex, 0.24), s: shade(hex, -0.3) }; }
-const P = {
-  brown: pal('#8a5a3a'), cream: pal('#eee0c0'), mint: pal('#74c6a9'), ver: pal('#e0553a'),
-  skin: pal('#e9b48b'), slab: pal('#d6c9ad'), mann: pal('#b6c3cf'), door: pal('#5c3f2c'),
-  chair: pal('#c84a32'), wall: pal('#7d8fa3'), hand: pal('#e9b48b'), ghost: pal('#f6f1e4')
+// ---------- constants ----------
+const COLS=8, ROWS=14, MAXH=11, GAP=2, HEADY=22.5, GRAV=26, CUTMIN=1.2, MAXPART=120, MAXRUB=60;
+const PAL={
+  bg:'#6f8293', bg2:'#687c8d', base:'#53667a', wallShadow:'#5f7284',
+  floor:'#d9caa4', floor2:'#c9b78f', slab:'#9a7255',
+  hair:'#7a5236', beard:'#efe3c6', mint:'#7fcbb0', mintD:'#4f907d', ver:'#e2573b',
+  skin:'#f0c9a0', cheek:'#eda98c', eye:'#3a2a20', mouth:'#7a3226', white:'#fff8ea',
+  chair:'#c9503a', pole:'#55626e', glass:'#a8c6d0', frame:'#8a5a3a', cream:'#f6ecd2', door:'#6b4630'
 };
-const BG = '#6c8095', FLOOR = '#8e9cab', FLOORLN = '#8393a3', DARK = '#262d3a', GAPC = '#3b4656';
-
-/* ---------- かつら(長さ違い) ---------- */
-const WIGS = [
-  { hair: 'ver', bang: 3, side: 3, beard: 3 },     // みじかい
-  { hair: 'brown', bang: 4, side: 5, beard: 5 },   // ふつう(最初の髪)
-  { hair: 'mint', bang: 5, side: 6, beard: 6 }     // ながい
+const WIGS=[
+  {bang:2.5,side:2.6,beard:3.3,mus:1.7,tuft:0.45},
+  {bang:4.6,side:5.2,beard:7.4,mus:2.3,tuft:0.8},
+  {bang:6.0,side:6.8,beard:9.2,mus:2.7,tuft:1.15}
 ];
+const MESSY=[1,0.64,1.04,0.67,1.02,0.65,1,0.62];
+const BEARDY=[5.0,5.8,6.4,6.8,6.8,6.4,5.8,5.0];
+const TUFT=[0.6,1.0,0.7,1.1,0.8,1.0,0.6,0.9];
 
-let TID = 0;
-function T(kind, x, root, len, stub, col) {
-  return { id: ++TID, kind, x, root, len, stub, col, disp: len, sq: 0, sqv: 0, ph: Math.random() * 6, hop: 0, part: 0 };
-}
-function makeTufts(w, grow) {
-  const a = [];
-  [-2, -1, 0, 1, 2].forEach(x => a.push(T('bang', x, 1, w.bang, 1, w.hair)));
-  [-4, 4].forEach(x => a.push(T('side', x, 1, w.side, 1, w.hair)));
-  [-2, -1, 0, 1, 2].forEach(x => a.push(T('beard', x, 6.6, w.beard, 1, 'cream')));
-  [-0.75, 0.75].forEach(x => a.push(T('mus', x, 5.1, 2, 0, 'brown')));
-  if (grow) a.forEach(t => { t.disp = 0; });
-  return a;
-}
-const WIG_TUFTS = WIGS.map(w => makeTufts(w, false));
+// ---------- utils ----------
+const clamp=(v,a,b)=>v<a?a:v>b?b:v, lerp=(a,b,t)=>a+(b-a)*t;
+const ease=t=>t<=0?0:t>=1?1:t*t*(3-2*t);
+const rnd=(a,b)=>a+Math.random()*(b-a);
+function hex2rgb(h){const n=parseInt(h.slice(1),16);return [n>>16&255,n>>8&255,n&255];}
+function tint(hex,f){const c=hex2rgb(hex);const q=x=>clamp(Math.round(x*f),0,255).toString(16).padStart(2,'0');return '#'+q(c[0])+q(c[1])+q(c[2]);}
+function mix(a,b,t){const x=hex2rgb(a),y=hex2rgb(b);const q=i=>clamp(Math.round(lerp(x[i],y[i],t)),0,255).toString(16).padStart(2,'0');return '#'+q(0)+q(1)+q(2);}
+const shadeCache=new Map();
+function shade(hex,f){f=Math.round(f*50)/50;const k=hex+f;let v=shadeCache.get(k);
+  if(!v){const c=hex2rgb(hex);v='rgb('+clamp(c[0]*f|0,0,255)+','+clamp(c[1]*f|0,0,255)+','+clamp(c[2]*f|0,0,255)+')';
+    if(shadeCache.size>4000)shadeCache.clear();shadeCache.set(k,v);}return v;}
 
-/* ---------- 状態 ---------- */
-const S = {
-  t: 0, mode: 'build', houses: [], cur: null, tufts: [], pieces: [], parts: [], trail: [], rings: [], timers: [],
-  uncle: {
-    x: 0, y: 0, tx: 0, ty: 0, tilt: 0, bow: 0, bowT: 0, shrug: 0, expr: 'neutral', exprT: 0,
-    blink: 0, blinkT: 2.5, burst: [0, 0], seen: [false, false], lx: 0, ly: 600, px: 0, py: 0,
-    mirror: 0, mirrorT: 0, blush: 0, laugh: 0, partT: 0, partCool: 3, partAmt: 0, hairCol: 'brown', bounce: 0, turn: 0
-  },
-  hands: [{ x: -124, y: 364, g: null }, { x: 124, y: 364, g: null }],
-  hat: { state: 'hook', x: 0, y: 0, drop: 0, fly: null },
-  shelf: 0, shelfT: 0, wigFly: null, wigSpec: WIGS[1], cycle: 0, suggest: 0,
-  idle: 0, demoAt: 4, demo: null, target: null, targetCool: 0,
-  combo: 0, lastCut: -9, wob: { mirror: 0, hat: 0, face: 0, shelf: [0, 0, 0] }, active: null, plotCx: 0,
-  compPending: false, BID: 0, log: []
-};
-function after(d, fn) { S.timers.push({ t: S.t + d, fn }); }
-function rand(a, b) { return a + Math.random() * (b - a); }
-function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
-function lerp(a, b, t) { return a + (b - a) * t; }
-function note(ev) { S.log.push({ t: +S.t.toFixed(2), ev }); if (S.log.length > 400) S.log.shift(); }
+// ---------- layout ----------
+let W=0,H=0,DPR=1,U=20,foundX=0,floorY=0,DX=0,DY=0;
+const safe={t:0,r:0,b:0,l:0};
+function readSafe(){try{const s=getComputedStyle(document.getElementById('safe'));
+  safe.t=parseFloat(s.paddingTop)||0;safe.r=parseFloat(s.paddingRight)||0;safe.b=parseFloat(s.paddingBottom)||0;safe.l=parseFloat(s.paddingLeft)||0;}catch(e){}}
+function resize(){
+  DPR=Math.min(2,window.devicePixelRatio||1);W=Math.max(1,window.innerWidth);H=Math.max(1,window.innerHeight);
+  cv.width=Math.round(W*DPR);cv.height=Math.round(H*DPR);readSafe();
+  const aw=W-safe.l-safe.r, ah=H-safe.t-safe.b;
+  U=Math.max(6,Math.min(ah/26.6,aw/16));
+  const extra=Math.max(0,ah-26.6*U);
+  floorY=safe.t+extra*0.55+25.1*U;
+  foundX=safe.l+aw/2-4*U;
+  DX=0.36*U;DY=-0.28*U;
+  G.trail.length=0;
+}
+const sx=X=>foundX+X*U, sy=Y=>floorY-Y*U;
+const wx=px=>(px-foundX)/U, wy=py=>(floorY-py)/U;
 
-/* ---------- レイアウト ---------- */
-function readSafe() {
-  try {
-    const cs = getComputedStyle(saEl);
-    SA.t = parseFloat(cs.paddingTop) || 0; SA.r = parseFloat(cs.paddingRight) || 0;
-    SA.b = parseFloat(cs.paddingBottom) || 0; SA.l = parseFloat(cs.paddingLeft) || 0;
-  } catch (e) { SA.t = SA.r = SA.b = SA.l = 0; }
+// ---------- drawing primitive: flat-shaded prism ----------
+const LX=-0.55,LY=-0.835;
+function face(ax,ay,bx,by,dx,dy,nx,ny,col){
+  if(nx*dx+ny*dy<=0.01)return;
+  ctx.fillStyle=shade(col,0.92+0.28*(nx*LX+ny*LY));
+  ctx.beginPath();ctx.moveTo(ax,ay);ctx.lineTo(bx,by);ctx.lineTo(bx+dx,by+dy);ctx.lineTo(ax+dx,ay+dy);ctx.closePath();ctx.fill();
 }
-function layout() {
-  W = Math.max(1, window.innerWidth); H = Math.max(1, window.innerHeight);
-  DPR = Math.min(2, window.devicePixelRatio || 1);
-  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
-  readSafe();
-  const aw = Math.max(200, W - SA.l - SA.r), ah = Math.max(300, H - SA.t - SA.b);
-  K = Math.min(aw / 390, ah / 840);
-  LW = aw / K; LH = ah / K;
-  L.ox = SA.l + aw / 2; L.oy = SA.t;
-  L.base = LH - 58;
-  L.headTop = 112;
-  L.horizon = L.headTop + 15 * V;
-  L.mirrorX = Math.min(LW / 2 - 50, 250);
-  placeHouses(true);
+function box(cx,cy,w,h,ang,dep,col,mask){
+  if(mask===undefined)mask=15;
+  const c=Math.cos(ang),s=Math.sin(ang),hw=w/2,hh=h/2;
+  const ux=c*hw,uy=s*hw,vx=-s*hh,vy=c*hh;
+  const p0x=cx-ux-vx,p0y=cy-uy-vy,p1x=cx+ux-vx,p1y=cy+uy-vy,p2x=cx+ux+vx,p2y=cy+uy+vy,p3x=cx-ux+vx,p3y=cy-uy+vy;
+  if(dep>0){const dx=DX*dep,dy=DY*dep;
+    if(mask&1)face(p0x,p0y,p1x,p1y,dx,dy,s,-c,col);
+    if(mask&2)face(p1x,p1y,p2x,p2y,dx,dy,c,s,col);
+    if(mask&4)face(p2x,p2y,p3x,p3y,dx,dy,-s,c,col);
+    if(mask&8)face(p3x,p3y,p0x,p0y,dx,dy,-c,-s,col);
+  }
+  ctx.fillStyle=col;ctx.beginPath();ctx.moveTo(p0x,p0y);ctx.lineTo(p1x,p1y);ctx.lineTo(p2x,p2y);ctx.lineTo(p3x,p3y);ctx.closePath();ctx.fill();
 }
-function placeHouses(snap) {
-  const n = S.houses.length;
-  S.plotCx = (LW < 560 && n > 1) ? 56 : 0;
-  S.houses.forEach((h, i) => {
-    h.tcx = S.plotCx - (n - 1 - i) * SPACING;
-    if (snap) h.cx = h.tcx;
-  });
-}
-function X0(h) { return h.cx - COLS * CELL / 2; }
-function headTop() { return L.headTop + S.uncle.y; }
-function toL(e) { return { x: (e.clientX - L.ox) / K, y: (e.clientY - L.oy) / K }; }
+// world box: center in world units, size in units
+function wbox(X,Y,w,h,ang,dep,col,mask,z){z=z||0;box(sx(X)-DX*z,sy(Y)-DY*z,w*U,h*U,ang,dep,col,mask);}
 
-/* ---------- 音 (Web Audio 合成) ---------- */
-let AC = null, master = null, noiseBuf = null;
-function initAudio() {
-  try {
-    if (!AC) {
-      const C = window.AudioContext || window.webkitAudioContext;
-      if (!C) return;
-      AC = new C();
-      master = AC.createGain(); master.gain.value = 0.55; master.connect(AC.destination);
-      noiseBuf = AC.createBuffer(1, AC.sampleRate * 0.5, AC.sampleRate);
-      const d = noiseBuf.getChannelData(0);
-      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
-      const b = AC.createBuffer(1, 1, AC.sampleRate), s = AC.createBufferSource();
-      s.buffer = b; s.connect(master); s.start(0);
-    }
-    if (AC.state === 'suspended') { const p = AC.resume(); if (p && p.catch) p.catch(() => {}); }
-  } catch (e) { AC = null; }
+// ---------- audio (Web Audio synth) ----------
+let AC=null,MG=null,NB=null;
+function audioInit(){
+  try{
+    if(!AC){const A=window.AudioContext||window.webkitAudioContext;if(!A)return;AC=new A();
+      MG=AC.createGain();MG.gain.value=0.55;MG.connect(AC.destination);
+      const len=(AC.sampleRate*0.6)|0;NB=AC.createBuffer(1,len,AC.sampleRate);const d=NB.getChannelData(0);
+      for(let i=0;i<len;i++)d[i]=Math.random()*2-1;}
+    if(AC.state!=='running'&&AC.resume){const p=AC.resume();if(p&&p.catch)p.catch(()=>{});}
+  }catch(e){AC=null;}
 }
-function tone(f, dur, o) {
-  if (!AC || AC.state !== 'running') return;
-  o = o || {};
-  try {
-    const t0 = AC.currentTime + (o.delay || 0);
-    const osc = AC.createOscillator(), g = AC.createGain();
-    osc.type = o.type || 'sine';
-    osc.frequency.setValueAtTime(f, t0);
-    if (o.to) osc.frequency.exponentialRampToValueAtTime(Math.max(20, o.to), t0 + dur);
-    const v = o.vol == null ? 0.2 : o.vol;
-    g.gain.setValueAtTime(0.0001, t0);
-    g.gain.exponentialRampToValueAtTime(v, t0 + (o.attack || 0.006));
-    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
-    osc.connect(g); g.connect(master);
-    osc.start(t0); osc.stop(t0 + dur + 0.03);
-  } catch (e) {}
-}
-function noise(dur, o) {
-  if (!AC || AC.state !== 'running' || !noiseBuf) return;
-  o = o || {};
-  try {
-    const t0 = AC.currentTime + (o.delay || 0);
-    const s = AC.createBufferSource(); s.buffer = noiseBuf;
-    const f = AC.createBiquadFilter(); f.type = o.type || 'bandpass'; f.frequency.value = o.freq || 2000; f.Q.value = o.q || 1;
-    const g = AC.createGain(); const v = o.vol == null ? 0.2 : o.vol;
-    g.gain.setValueAtTime(v, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
-    s.connect(f); f.connect(g); g.connect(master);
-    s.start(t0, Math.random() * 0.2); s.stop(t0 + dur + 0.02);
-  } catch (e) {}
-}
-const sfx = {
-  snip(c) {
-    const p = 1 + Math.min(c, 6) * 0.05;
-    noise(0.035, { freq: 5200 * p, type: 'highpass', vol: 0.22 });
-    tone(2500 * p, 0.035, { type: 'square', vol: 0.05, to: 1700 * p });
-    noise(0.03, { freq: 6500 * p, type: 'highpass', vol: 0.16, delay: 0.055 });
-  },
-  knock(sz) {
-    const f = sz <= 1 ? 880 : sz <= 2 ? 640 : sz <= 4 ? 430 : 290;
-    tone(f, 0.13, { type: 'triangle', vol: 0.28, to: f * 0.72 });
-    noise(0.05, { freq: f * 1.6, q: 2, vol: 0.13 });
-  },
-  squish() { tone(340, 0.13, { vol: 0.2, to: 210 }); },
-  blink() { tone(1750, 0.03, { vol: 0.08 }); tone(2100, 0.03, { vol: 0.08, delay: 0.13 }); },
-  giggle() { for (let i = 0; i < 6; i++) tone(640 + (i % 2) * 170 + i * 18, 0.07, { type: 'triangle', vol: 0.12, delay: i * 0.085 }); },
-  creak() { tone(150, 0.45, { type: 'sawtooth', vol: 0.06, to: 96 }); },
-  relief() { tone(392, 0.18, { vol: 0.14, to: 523 }); tone(659, 0.25, { vol: 0.11, delay: 0.15 }); },
-  crash() {
-    for (let i = 0; i < 5; i++) tone(rand(250, 560), 0.1, { type: 'triangle', vol: 0.2, delay: i * 0.06, to: 180 });
-    noise(0.32, { freq: 700, q: 0.7, vol: 0.18 });
-  },
-  roll() { tone(210, 0.22, { type: 'triangle', vol: 0.14, to: 170 }); noise(0.2, { freq: 300, q: 0.8, vol: 0.08 }); },
-  windowChime() { tone(1319, 0.5, { vol: 0.12 }); tone(1760, 0.6, { vol: 0.09, delay: 0.1 }); tone(2637, 0.4, { vol: 0.05, delay: 0.2 }); },
-  click(i) { tone(950 + i * 30, 0.04, { type: 'square', vol: 0.06 }); },
-  bump() { tone(130, 0.2, { vol: 0.3, to: 88 }); noise(0.06, { freq: 420, vol: 0.12 }); },
-  fanfare() {
-    [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.18, { type: 'triangle', vol: 0.18, delay: i * 0.11 }));
-    [523, 659, 784, 1047].forEach(f => tone(f, 0.9, { type: 'sine', vol: 0.08, delay: 0.5 }));
-  },
-  pop() { tone(480, 0.09, { to: 980, vol: 0.14 }); },
-  wig() { noise(0.25, { freq: 1300, q: 0.6, vol: 0.09 }); tone(380, 0.32, { to: 900, vol: 0.11, delay: 0.12 }); },
-  grow() { tone(300, 0.5, { to: 760, vol: 0.08, type: 'triangle' }); },
-  step(i, up) { tone(up ? 620 + i * 85 : 1150 - i * 85, 0.08, { type: 'triangle', vol: 0.14 }); },
-  bridge() { tone(784, 0.45, { vol: 0.12, to: 1047 }); tone(1568, 0.6, { vol: 0.06, delay: 0.2 }); },
-  tap() { tone(560, 0.05, { vol: 0.06 }); },
-  combo(n) { tone(880 + n * 60, 0.06, { type: 'triangle', vol: 0.07 }); }
+function tn(f,d,o){if(!AC)return;o=o||{};try{
+  const t=AC.currentTime+(o.at||0),os=AC.createOscillator(),g=AC.createGain();
+  os.type=o.type||'sine';os.frequency.setValueAtTime(f,t);if(o.to)os.frequency.exponentialRampToValueAtTime(o.to,t+d);
+  const v=o.v||0.2;g.gain.setValueAtTime(0.0001,t);g.gain.exponentialRampToValueAtTime(v,t+(o.a||0.006));g.gain.exponentialRampToValueAtTime(0.0001,t+d);
+  os.connect(g);g.connect(MG);os.start(t);os.stop(t+d+0.03);}catch(e){}}
+function nz(d,o){if(!AC||!NB)return;o=o||{};try{
+  const t=AC.currentTime+(o.at||0),src=AC.createBufferSource(),fl=AC.createBiquadFilter(),g=AC.createGain();
+  src.buffer=NB;fl.type=o.type||'bandpass';fl.frequency.setValueAtTime(o.f||2000,t);if(o.to)fl.frequency.exponentialRampToValueAtTime(o.to,t+d);fl.Q.value=o.q||1;
+  const v=o.v||0.2;g.gain.setValueAtTime(0.0001,t);g.gain.exponentialRampToValueAtTime(v,t+0.004);g.gain.exponentialRampToValueAtTime(0.0001,t+d);
+  src.connect(fl);fl.connect(g);g.connect(MG);src.start(t);src.stop(t+d+0.03);}catch(e){}}
+const SND={
+  snip(p){p=p||1;nz(0.035,{v:0.35,f:3800*p,q:2.5,type:'highpass'});tn(2100*p,0.025,{type:'square',v:0.05});nz(0.03,{v:0.3,f:5600*p,q:3,at:0.055});tn(2600*p,0.02,{type:'square',v:0.04,at:0.055});},
+  land(size){const f=clamp(820/(0.7+size*0.45),150,900);tn(f,0.14,{type:'triangle',v:0.3,to:f*0.72});nz(0.05,{v:0.18,f:f*2.2,q:5});},
+  squish(){tn(300,0.16,{v:0.22,to:520});tn(160,0.1,{type:'triangle',v:0.1,to:220});},
+  blink(){tn(1300,0.05,{v:0.12});tn(1560,0.05,{v:0.12,at:0.15});},
+  giggle(){for(let i=0;i<6;i++)tn(520+(i%2)*130+i*12,0.08,{type:'triangle',v:0.15,at:i*0.1,to:430});},
+  shrug(){tn(330,0.12,{type:'triangle',v:0.15,to:420});tn(440,0.17,{type:'triangle',v:0.15,at:0.14,to:360});},
+  hm(){tn(290,0.3,{type:'triangle',v:0.13,to:430});},
+  creak(){tn(95,0.45,{type:'sawtooth',v:0.05,to:120});nz(0.4,{v:0.05,f:300,q:8});},
+  crash(){for(let i=0;i<5;i++)tn(170-i*16,0.16,{type:'triangle',v:0.24,at:i*0.07,to:90});nz(0.35,{v:0.18,f:500,q:0.8});},
+  click(i){tn(1400+i*95,0.035,{type:'square',v:0.07});nz(0.02,{v:0.14,f:5200,q:3});},
+  fanfare(){const n=[523,659,784,1047];n.forEach((f,i)=>{tn(f,0.38,{type:'triangle',v:0.2,at:i*0.12});tn(f*2,0.25,{v:0.05,at:i*0.12});});
+    [523,659,784].forEach(f=>tn(f,0.7,{type:'triangle',v:0.12,at:0.5}));tn(2093,0.5,{v:0.06,at:0.55});},
+  bonk(){tn(210,0.16,{v:0.25,to:120});nz(0.06,{v:0.12,f:900});},
+  pop(){tn(560,0.11,{v:0.2,to:1100});},
+  glint(){tn(1760,0.2,{v:0.09});tn(2350,0.26,{v:0.07,at:0.07});},
+  settle(){tn(440,0.14,{type:'triangle',v:0.15});tn(660,0.2,{type:'triangle',v:0.15,at:0.1});},
+  step(i,up){const f=440*Math.pow(2,(up?i:-i)*2/12);tn(f,0.12,{type:'triangle',v:0.16});nz(0.02,{v:0.1,f:4000,q:3});},
+  bridge(i){tn(660+i*20,0.1,{type:'triangle',v:0.12});},
+  chime(){[784,988,1175,1568].forEach((f,i)=>tn(f,0.5,{v:0.1,at:i*0.09}));},
+  tick(){tn(880,0.04,{v:0.06,type:'triangle'});},
+  whoosh(){nz(0.3,{v:0.12,f:600,to:2400,q:1});},
+  roll(){tn(140,0.09,{type:'triangle',v:0.18,to:110});}
 };
 
-/* ---------- 家 ---------- */
-function newHouse(cx) {
-  const g = [];
-  for (let c = 0; c < COLS; c++) g.push(new Array(MAXR).fill(0));
-  g[DOORC][0] = -1; g[DOORC][1] = -1;
-  return {
-    cx, tcx: cx, g, blocks: [], windows: new Set(), eave: 0, roof: null, rubble: [], orderN: 0,
-    tiltL: 0, tiltR: 0, tiltLT: 0, tiltRT: 0, tiltState: 0, done: false, conn: null,
-    doorWob: 0, wob: 0, leftH: 0, rightH: 0, topH: 0, glow: 0
-  };
-}
-function colHeight(h, c) {
-  for (let r = MAXR - 1; r >= 0; r--) if (h.g[c][r] !== 0) return r + 1;
-  return 0;
-}
-function filled(h, c, r) { return c >= 0 && c < COLS && r >= 0 && r < MAXR && h.g[c][r] !== 0; }
-function wallH(h, side) {
-  let m = 0;
-  const cs = side < 0 ? [0, 1, 2] : [4, 5, 6];
-  for (const c of cs) m = Math.max(m, colHeight(h, c));
-  return m;
-}
-function slotOpen(h, c) {
-  if (h.g[c][1] !== 0 || h.g[c][2] !== 0) return false;
-  for (let r = 3; r < MAXR; r++) if (h.g[c][r] !== 0) return false;
-  return true;
-}
-function neighborsFilled(h, c) {
-  return filled(h, c - 1, 1) && filled(h, c - 1, 2) && filled(h, c + 1, 1) && filled(h, c + 1, 2);
-}
-// 小片が収まる一番低い場所(隙間を優先して埋める・窓の口は残す)
-function fillableRow(h, c) {
-  const isSlot = SLOTS.indexOf(c) >= 0;
-  const win = h.windows.has(c);
-  const open = isSlot && !win && slotOpen(h, c);
-  for (let r = 0; r < ROWLIM; r++) {
-    if (h.g[c][r] !== 0) continue;
-    if (isSlot && (r === 1 || r === 2) && (win || open)) continue;
-    if (open && r === 3 && !neighborsFilled(h, c)) return -1;
-    return r;
-  }
-  return -1;
-}
-function restRow(h, c0, w) {
-  let r = 0;
-  for (let c = c0; c < c0 + w; c++) r = Math.max(r, colHeight(h, c));
-  return r;
-}
-function hOf(n) { return n <= 2 ? 1 : n <= 4 ? 2 : 3; }
-function colF(xv) { return (xv + 4.5) / 9 * COLS; }
+// ---------- game state ----------
+const G={
+  t:0, phase:'play', strands:[], house:null, town:[], pieces:[], rolling:[], parts:[], trail:[],
+  invite:null, lastInput:-10, demo:null, demoDone:false, combo:0, lastCut:-10, mirrorAt:-1,
+  hat:{state:'hook',t:0,pop:1,wob:0,wv:0}, mirror:{wob:0,wv:0}, seq:null, seqHold:0, shift:null, wigs:[], wigHL:0,
+  cycle:0, wig:1, firstTap:-1, strokeN:0,
+  ev:{eyes:0,shrug:0,tilt:0,tiltFix:0,window:0,roll:0,tower:0,collapse:0,eave:0,laugh:0,complete:0,stairs:0,bridge:0,wig:0,cuts:0,landed:0,hm:0,mirror:0,part:0,demo:0}
+};
+const hd={rot:0,rv:0,dx:0,dy:0};
+const UN={sur:0,laugh:0,shrug:0,sheep:0,proud:0,mirror:0,blinkT:-1,nextBlink:2.2,blinkQ:0,gx:0,gy:0.3,
+  asym:0,body:0,bow:0,crouchT:-1,hand:null,faceWob:0,fv:0,partT:-1,partDone:false,eyeCov:[true,true],surBig:0};
 
-function planSmall(h, cf) {
-  const c0 = clamp(Math.floor(cf), 0, COLS - 1);
-  let best = null;
-  for (const dc of [0, -1, 1]) {
-    const c = c0 + dc;
-    if (c < 0 || c >= COLS) continue;
-    const r = fillableRow(h, c);
-    if (r < 0) continue;
-    if (!best || r < best.r) best = { c, r };
-  }
-  if (!best) {
-    for (let c = 0; c < COLS; c++) {
-      const r = fillableRow(h, c);
-      if (r >= 0 && (!best || r < best.r || (r === best.r && Math.abs(c - c0) < Math.abs(best.c - c0)))) best = { c, r };
-    }
-  }
-  if (!best) best = { c: c0, r: colHeight(h, c0), over: true };
-  return best;
-}
-function planBlock(p) {
-  const h = S.cur;
-  if (p.fixedC != null) {
-    return { c: p.fixedC, r: restRow(h, p.fixedC, p.w) };
-  }
-  const cf = p.cf != null ? p.cf : colF(p.xs.reduce((a, b) => a + b, 0) / p.xs.length);
-  if (p.w === 1 && p.h === 1) return planSmall(h, cf);
-  const w = Math.min(p.w, COLS);
-  const c0 = clamp(Math.round(cf - w / 2), 0, COLS - w);
-  return { c: c0, r: restRow(h, c0, w) };
-}
-function findTower(h, c0, w, r) {
-  let best = null;
-  const cand = [c0 - 1, c0 - 2, c0 + w, c0 + w + 1];
-  for (const tc of cand) {
-    if (tc < 0 || tc >= COLS) continue;
-    const ch = colHeight(h, tc);
-    if (tc === DOORC && ch <= 2) continue;
-    if (ch >= r + 2 && ch >= 3) {
-      const dist = tc < c0 ? c0 - tc : tc - (c0 + w - 1);
-      if (!best || dist < best.dist || (dist === best.dist && ch > best.ch)) best = { tc, dist, ch, dir: tc < c0 ? -1 : 1 };
-    }
-  }
-  return best;
-}
-function blockSide(b) { const cc = b.c + (b.w - 1) / 2; return cc < 3 ? -1 : cc > 3 ? 1 : 0; }
+function newHouse(){return {cells:Array.from({length:ROWS},()=>Array(COLS).fill(null)),win:new Set(),
+  tilt:0,tiltV:0,tiltT:0,wob:0,wv:0,roof:0,eave:0,door:0,anim:new Map(),rubble:[],height:0,passage:null,
+  nextId:1,flash:Array(COLS).fill(0),creaked:false,tiltBig:false,collapseCD:0,ledgeGlow:0};}
+function topOf(h,c){for(let r=ROWS-1;r>=0;r--)if(h.cells[r][c])return r+1;return 0;}
+function houseHeight(h){let m=0;for(let c=0;c<COLS;c++)m=Math.max(m,topOf(h,c));return m;}
 
-function placeBlock(h, p, c, r) {
-  const b = { id: ++S.BID, c, r, w: p.w, h: p.h, col: p.col, order: h.orderN++, kind: p.kind, land: 1, pop: 0, ry: r, small: p.w === 1 && p.h === 1 };
-  for (let cc = c; cc < c + b.w; cc++) for (let rr = r; rr < r + b.h; rr++) h.g[cc][rr] = b.id;
-  h.blocks.push(b);
-  // 窓: 小片が開口の上にまぐさとして載り、左右が埋まっていたら窓枠
-  if (b.small && SLOTS.indexOf(c) >= 0 && r === 3 && !h.windows.has(c) &&
-      h.g[c][1] === 0 && h.g[c][2] === 0 && h.g[c][0] !== 0 && neighborsFilled(h, c)) {
-    h.windows.add(c);
-    sfx.windowChime();
-    const x = X0(h) + (c + 0.5) * CELL, y = L.base - 2 * CELL;
-    burst(x, y, 10, 'spark', P.mint.f);
-    S.uncle.expr = 'happy'; S.uncle.exprT = 1.0;
-    note('window:' + c);
-  }
-  return b;
-}
-function knock(h, list, dir) {
-  const x0 = X0(h);
-  for (const b of list) {
-    const i = h.blocks.indexOf(b);
-    if (i < 0) continue;
-    h.blocks.splice(i, 1);
-    for (let cc = b.c; cc < b.c + b.w; cc++) for (let rr = b.r; rr < b.r + b.h; rr++) if (h.g[cc][rr] === b.id) h.g[cc][rr] = 0;
-    const d = dir || (blockSide(b) || (Math.random() < 0.5 ? -1 : 1));
-    addRubble(h, x0 + (b.c + b.w / 2) * CELL, L.base - (b.ry + b.h / 2) * CELL, b, d);
-  }
-}
-function addRubble(h, x, y, b, dir) {
-  h.rubble.push({
-    rx: x - h.cx, y, vx: dir * rand(110, 260), vy: rand(-380, -200), rot: 0, vr: dir * rand(4, 9),
-    w: b.w, h: b.h, col: b.col, rest: false, fy: L.base + rand(12, 44), s: 0.72
-  });
-  while (h.rubble.length > MAXRUBBLE) h.rubble.shift();
-}
-// 支えを失った積み木を落とす(窓の口は保護)
-function resettle(h) {
-  for (let c = 0; c < COLS; c++) for (let r = 0; r < MAXR; r++) if (h.g[c][r] > 0) h.g[c][r] = 0;
-  for (const c of h.windows) { h.g[c][1] = -2; h.g[c][2] = -2; }
-  const bl = h.blocks.slice().sort((a, b) => a.r - b.r);
-  for (const b of bl) {
-    let r = b.r;
-    while (r > 0) {
-      let free = true;
-      for (let c = b.c; c < b.c + b.w; c++) if (h.g[c][r - 1] !== 0) { free = false; break; }
-      if (!free) break;
-      r--;
-    }
-    b.r = r;
-    for (let c = b.c; c < b.c + b.w; c++) for (let rr = r; rr < r + b.h; rr++) h.g[c][rr] = b.id;
-  }
-  for (const c of h.windows) {
-    if (h.g[c][1] === -2) h.g[c][1] = 0;
-    if (h.g[c][2] === -2) h.g[c][2] = 0;
-  }
-  for (const c of Array.from(h.windows)) {
-    if (!(filled(h, c, 3) && filled(h, c, 0) && neighborsFilled(h, c))) h.windows.delete(c);
-  }
-}
-function updateTilt(h, depth) {
-  const Lh = wallH(h, -1), Rh = wallH(h, 1), d = Lh - Rh;
-  if (Math.abs(d) >= 4 && !depth) {
-    const side = d > 0 ? -1 : 1, low = Math.min(Lh, Rh);
-    const cs = side < 0 ? [0, 1, 2] : [4, 5, 6];
-    const list = h.blocks.filter(b => b.r + b.h > low + 2 && cs.some(c => c >= b.c && c < b.c + b.w));
-    if (list.length) {
-      knock(h, list, side);
-      resettle(h);
-      sfx.crash();
-      S.uncle.expr = 'oops'; S.uncle.exprT = 1.3; S.uncle.shrug = 1;
-      note('collapse:' + (side < 0 ? 'L' : 'R'));
-      return updateTilt(h, 1);
-    }
-  }
-  h.tiltLT = d >= 2 ? -Math.min(10, (d - 1) * 4) : 0;
-  h.tiltRT = d <= -2 ? Math.min(10, (-d - 1) * 4) : 0;
-  const st = d >= 2 ? -1 : d <= -2 ? 1 : 0;
-  if (st !== 0 && h.tiltState === 0) {
-    sfx.creak(); S.uncle.expr = 'worried'; S.uncle.exprT = 1.6; note('tilt:' + (st < 0 ? 'L' : 'R'));
-  } else if (st === 0 && h.tiltState !== 0) {
-    sfx.relief(); S.uncle.expr = 'happy'; S.uncle.exprT = 1.2;
-    const x0 = X0(h);
-    burst(x0 + CELL * 1.5, L.base - Lh * CELL, 6, 'spark', '#ffffff');
-    burst(x0 + CELL * 5.5, L.base - Rh * CELL, 6, 'spark', '#ffffff');
-    note('tilt:recover');
-  }
-  h.tiltState = st;
+function makeStrands(w,gk){
+  const S=[],j=()=>rnd(-0.12,0.12);
+  const mk=(g,ax,ay,a,max,col,wd)=>({g,ax,ay,a,max,len:Math.max(0.5,max),col,wd,wob:0,wv:0,sq:1,sv:0,gk:gk,dust:0,glow:0});
+  for(let c=0;c<8;c++)S.push(mk('beard',c+0.5,BEARDY[c],(c-3.5)*0.03,w.beard*MESSY[(c+3)%8]+j(),c,0.95));
+  S.push(mk('side',-1.3,1.7,0,w.side*0.82+j(),0,1.0),mk('side',-0.5,1.1,0,w.side+j(),0,1.0),
+         mk('side',9.3,1.7,0,w.side*0.78+j(),7,1.0),mk('side',8.5,1.1,0,w.side*0.94+j(),7,1.0));
+  for(let c=0;c<8;c++)S.push(mk('bang',c+0.5,0.55,(c-3.5)*0.025,w.bang*MESSY[c]+j(),c,0.92));
+  const xs=[2.4,3.0,3.6,4.4,5.0,5.6];
+  for(const x of xs)S.push(mk('mus',x,5.0,(x<4?-1:1)*(0.5+Math.abs(x-4)*0.35),w.mus*(1-Math.abs(x-4)*0.1),clamp(Math.floor(x),0,7),0.7));
+  return S;
 }
 
-/* ---------- 粒子 ---------- */
-function burst(x, y, n, type, col) {
-  for (let i = 0; i < n; i++) {
-    if (S.parts.length >= MAXPART) S.parts.shift();
-    const a = rand(0, Math.PI * 2), sp = type === 'spark' ? rand(60, 200) : rand(40, 160);
-    S.parts.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - (type === 'dust' ? 40 : 80), life: type === 'spark' ? 0.6 : 0.5, max: 0.6, col, sz: type === 'spark' ? rand(3, 6) : rand(3, 7), type, rot: rand(0, 3) });
-  }
-}
+// ---------- head transform ----------
+function H2S(x,y){const px=x-4,py=y-7,c=Math.cos(hd.rot),s=Math.sin(hd.rot);
+  return [sx(4+px*c-py*s+hd.dx), sy(HEADY-(7+px*s+py*c+hd.dy))];}
+function sGeom(s){const p=H2S(s.ax,s.ay);const A=s.a+s.wob-hd.rot;
+  return {x:p[0],y:p[1],dx:Math.sin(A),dy:Math.cos(A),A,L:s.len*U*s.sq*s.gk};}
+const cuttable=s=>s.len>CUTMIN&&s.gk>0.95;
 
-/* ---------- 切る ---------- */
-function tuftGeo(t) {
-  const u = S.uncle, top = headTop();
-  const root = top + t.root * V;
-  return { x: u.x + t.x * V, root, tip: root + t.len * V };
-}
-function cutSegment(x0, y0, x1, y1) {
-  const a = S.active;
-  const dx = x1 - x0, dy = y1 - y0;
-  a.travel += Math.abs(dx);
-  if (a.travel < 12) return;
-  if (Math.abs(dx) < Math.abs(dy) * 0.32 && Math.hypot(dx, dy) > 3) return; // 縦の動きでは切らない
-  const minx = Math.min(x0, x1), maxx = Math.max(x0, x1);
-  for (const t of S.tufts) {
-    if (a.cut.has(t) || t.len <= t.stub) continue;
-    const g = tuftGeo(t);
-    const hb = (t.kind === 'mus' ? 0.5 : 0.5) * V + 2;
-    if (maxx < g.x - hb || minx > g.x + hb) continue;
-    let y;
-    if (Math.abs(dx) < 0.001) y = (y0 + y1) / 2;
-    else { const u = clamp((g.x - x0) / dx, 0, 1); y = y0 + dy * u; }
-    const lo = g.root + t.stub * V - 6, hi = g.tip + 0.45 * V;
-    if (y < lo || y > hi) continue;
-    doCut(t, y, g);
-  }
-}
-function doCut(t, y, g) {
-  const a = S.active;
-  let keep = Math.round((y - g.root) / V);
-  keep = clamp(keep, t.stub, t.len - 1);
-  const cutLen = t.len - keep;
-  const oldLen = t.len;
-  t.len = keep; t.disp = keep; t.sq = 0; t.sqv = -2.2;
-  a.cut.add(t);
-  const isTarget = S.target && S.target.type === 'tuft' && S.target.t === t;
-  const yCut = g.root + keep * V;
-  // 同じ一筋で隣り合う房は一つの角材にまとまる(横幅)
-  let gp = a.group;
-  const join = gp && gp.kind === t.kind && S.t - gp.t < 0.45 && Math.abs(t.x - gp.lastX) <= 1.1 &&
-    gp.p.state === 'fall' && S.pieces.indexOf(gp.p) >= 0 && (t.kind === 'mus' || (gp.p.w < 3 && gp.p.h >= 2 && hOf(cutLen) >= 2));
-  const u = S.uncle;
-  if (join) {
-    const p = gp.p;
-    p.xs.push(t.x);
-    if (p.type === 'eave') p.elen += cutLen;
-    else { p.w = p.xs.length; p.h = Math.max(p.h, hOf(cutLen)); }
-    gp.lastX = t.x; gp.t = S.t;
-  } else {
-    let p;
-    const x = u.x + t.x * V;
-    if (t.kind === 'mus') {
-      p = { type: 'eave', x, y: yCut + cutLen * V, vx: 0, vy: -60, w: 1, h: 1, elen: cutLen, col: t.col, s: 0.6, rot: 0, vr: 0, state: 'fall', xs: [t.x], t: 0 };
-    } else {
-      p = { type: 'block', x, y: yCut + cutLen * V, vx: 0, vy: -140, w: 1, h: hOf(cutLen), col: t.col, s: V / CELL, rot: rand(-0.12, 0.12), vr: rand(-2, 2), state: 'fall', xs: [t.x], kind: t.kind, t: 0 };
-    }
-    S.pieces.push(p);
-    a.group = { p, kind: t.kind, lastX: t.x, t: S.t };
-  }
-  // 反応
-  S.combo = (S.t - S.lastCut < 1.4) ? S.combo + 1 : 1;
-  S.lastCut = S.t;
-  sfx.snip(S.combo);
-  if (S.combo >= 3) sfx.combo(S.combo);
-  burst(g.x, yCut, 4, 'hair', P[t.col].f);
-  burst(g.x, yCut, 2, 'spark', '#ffffff');
-  S.parts.length > MAXPART && S.parts.splice(0, S.parts.length - MAXPART);
-  if (t.kind === 'bang') { u.expr = isTarget ? 'surprise' : 'wow'; u.exprT = 0.8; }
-  else if (t.kind === 'beard') { u.expr = isTarget ? 'shrug' : 'wow'; u.exprT = 0.9; u.shrug = 1; }
-  else if (t.kind === 'side') { u.expr = isTarget ? 'happy' : 'wow'; u.exprT = 0.8; }
-  else if (t.kind === 'mus') { u.expr = 'giggle'; u.exprT = 1.5; u.laugh = 1.5; u.blush = 1; sfx.giggle(); }
-  u.bounce = Math.min(1.6, 0.5 + S.combo * 0.18);
-  u.mirrorT = 0; S.mirrorAt = S.t + 0.9;
-  S.targetCool = 0;
-  note('cut:' + t.kind + ':' + t.x + ':' + oldLen + '->' + keep);
-}
+// ---------- particles ----------
+function addPart(X,Y,vx,vy,col,s,life,grav){if(G.parts.length>=MAXPART)G.parts.shift();
+  G.parts.push({X,Y,vx,vy,col,s,life,max:life,grav:grav===undefined?1:grav,ang:rnd(0,3)});}
 
-/* ---------- タップ ---------- */
-function hitTuft(x, y) {
-  let best = null, bd = 1e9;
-  for (const t of S.tufts) {
-    if (t.disp <= 0.05) continue;
-    const g = tuftGeo(t);
-    const hb = (t.kind === 'mus' ? 0.4 : 0.5) * V + 10;
-    const tip = g.root + Math.max(t.len, 0.6) * V;
-    if (Math.abs(x - g.x) > hb || y < g.root - 6 || y > tip + 0.5 * V) continue;
-    const d = Math.abs(x - g.x) + (t.kind === 'mus' ? -4 : 0);
-    if (d < bd) { bd = d; best = t; }
-  }
-  return best;
+// ---------- cutting ----------
+let stroke=null, activePointer=null;
+function cutSeg(x0,y0,x1,y1){
+  if(G.phase!=='play')return;
+  const d=Math.hypot(x1-x0,y1-y0),n=Math.max(1,Math.ceil(d/(0.22*U)));
+  const dir=Math.sign(x1-x0)||(stroke?stroke.dir:1);
+  if(stroke&&Math.abs(x1-x0)>1)stroke.dir=dir;
+  for(let i=1;i<=n;i++){const px=lerp(x0,x1,i/n),py=lerp(y0,y1,i/n);
+    for(const s of G.strands){if(!cuttable(s))continue;const g=sGeom(s);
+      const rx=px-g.x,ry=py-g.y,along=rx*g.dx+ry*g.dy,across=Math.abs(rx*g.dy-ry*g.dx);
+      if(across<0.64*U&&along>0.38*U&&along<g.L-0.12*U){cutStrand(s,along/(U*s.sq*s.gk),dir,g);}
+    }}
 }
-function hitRubble(x, y) {
-  const h = S.cur; if (!h) return null;
-  for (let i = h.rubble.length - 1; i >= 0; i--) {
-    const r = h.rubble[i];
-    const rx = h.cx + r.rx, w = r.w * CELL * r.s, hh = r.h * CELL * r.s;
-    if (Math.abs(x - rx) < w / 2 + 12 && y > r.y - hh - 12 && y < r.y + 12) return r;
-  }
-  return null;
-}
-function wigPos(i) { const sp = Math.min(150, LW * 0.3); return { x: (i - 1) * sp, y: 14 - (1 - S.shelf) * 150 }; }
-function hitWig(x, y) {
-  const sp = Math.min(150, LW * 0.3);
-  for (let i = 0; i < 3; i++) {
-    const p = wigPos(i);
-    if (Math.abs(x - p.x) < sp / 2 && y > p.y - 8 && y < p.y + 102) return i;
-  }
-  return -1;
-}
-function tapAt(x, y) {
-  if (S.mode === 'choose') {
-    const i = hitWig(x, y);
-    if (i >= 0) { pickWig(i); return; }
-  }
-  if (S.mode === 'build') {
-    const t = hitTuft(x, y);
-    if (t) {
-      t.sq = 0.3; t.sqv = 0;
-      for (const o of S.tufts) if (o !== t && o.kind === t.kind && Math.abs(o.x - t.x) <= 1.1) o.sqv -= 1.2;
-      sfx.squish();
-      const u = S.uncle;
-      if (u.expr === 'neutral') { u.blink = 0.15; }
-      note('tap:' + t.kind + ':' + t.x);
-      return;
-    }
-    const r = hitRubble(x, y);
-    if (r) { rethrow(r); return; }
-  }
-  // 関係ない物は小さく揺れるだけ
-  const ht = headTop(), u = S.uncle;
-  if (Math.abs(x - L.mirrorX) < 46 && y > L.headTop - 6 && y < L.headTop + 116) { S.wob.mirror = 1; sfx.tap(); return; }
-  if (S.hat.state === 'hook' && Math.abs(x + L.mirrorX) < 46 && y > L.headTop + 10 && y < L.headTop + 90) { S.wob.hat = 1; sfx.tap(); return; }
-  if (Math.abs(x - u.x) < 5 * V && y > ht - 30 && y < ht + 14.5 * V) { S.wob.face = 1; sfx.tap(); return; }
-  const h = S.cur;
-  if (h) {
-    const x0 = X0(h);
-    if (x > x0 - 8 && x < x0 + COLS * CELL + 20 && y > L.base - Math.max(2, h.topH || restMax(h)) * CELL - 20 && y < L.base + 14) { h.wob = 1; sfx.tap(); return; }
-  }
-}
-function restMax(h) { let m = 0; for (let c = 0; c < COLS; c++) m = Math.max(m, colHeight(h, c)); return m; }
-function rethrow(r) {
-  const h = S.cur;
-  const i = h.rubble.indexOf(r); if (i < 0) return;
-  h.rubble.splice(i, 1);
-  const x = h.cx + r.rx;
-  let cf = (x - X0(h)) / CELL;
-  cf = clamp(cf, 0.2, COLS - 0.2);
-  const p = { type: 'block', x, y: r.y, vx: 0, vy: -760, w: r.w, h: r.h, col: r.col, s: r.s, rot: r.rot, vr: rand(-3, 3), state: 'fall', xs: [0], cf, kind: 'rubble', noroll: true, t: 0 };
-  S.pieces.push(p);
-  sfx.pop();
-  note('rethrow');
-}
-
-/* ---------- 角材の落下・着地 ---------- */
-function updatePieces(dt) {
-  const h = S.cur;
-  for (let i = S.pieces.length - 1; i >= 0; i--) {
-    const p = S.pieces[i];
-    p.t += dt;
-    if (p.type === 'eave') {
-      const x0 = X0(h), tx = x0 + (DOORC + 0.5) * CELL, ty = L.base - 2 * CELL - 4;
-      p.vy += 1500 * dt; p.y += p.vy * dt;
-      p.x += (tx - p.x) * Math.min(1, dt * 5);
-      p.s += (1 - p.s) * Math.min(1, dt * 4);
-      if (p.y >= ty && p.vy > 0) {
-        h.eave = Math.min(4, h.eave + p.elen);
-        sfx.knock(1);
-        burst(tx, ty, 5, 'dust', '#e8ddc6');
-        S.pieces.splice(i, 1);
-        note('eave:' + h.eave);
-      }
-      continue;
-    }
-    if (p.state === 'fall') {
-      p.vy += 2000 * dt; p.y += p.vy * dt;
-      p.rot += p.vr * dt; p.rot *= Math.pow(0.1, dt);
-      p.s += (1 - p.s) * Math.min(1, dt * 4.5);
-      p.plan = planBlock(p);
-      const pl = p.plan;
-      const tx = X0(h) + (pl.c + p.w / 2) * CELL, ty = L.base - pl.r * CELL;
-      p.x += (tx - p.x) * Math.min(1, dt * 7);
-      if (p.y >= ty && p.vy > 0) {
-        p.x = tx; p.y = ty;
-        landPiece(p, pl, i);
-      }
-    } else if (p.state === 'roll') {
-      p.rt += dt;
-      const k = clamp(p.rt / p.rdur, 0, 1);
-      const x0 = X0(h);
-      const fx = x0 + (p.rc0 + p.w / 2) * CELL, txx = x0 + (p.rc1 + p.w / 2) * CELL;
-      p.x = lerp(fx, txx, k);
-      p.y = L.base - lerp(p.rr0, p.rr0, k) * CELL - Math.sin(k * Math.PI * Math.max(1, Math.abs(p.rc1 - p.rc0))) * 6;
-      p.rot = p.rdir * k * Math.PI * 0.5 * Math.max(1, Math.abs(p.rc1 - p.rc0));
-      if (k >= 1) {
-        // 塔にぶつかる
-        const t = p.tower;
-        const list = h.blocks.filter(b => t.tc >= b.c && t.tc < b.c + b.w && b.r + b.h > p.rr0 + 1);
-        knock(h, list, p.rdir);
-        resettle(h);
-        sfx.crash();
-        burst(x0 + (t.tc + 0.5) * CELL, L.base - (p.rr0 + 2) * CELL, 10, 'dust', '#e8ddc6');
-        S.uncle.expr = 'oops'; S.uncle.exprT = 1.3; S.uncle.shrug = 1;
-        note('roll-crash:' + list.length);
-        p.state = 'fall'; p.fixedC = p.rc1; p.noroll = true; p.lock = false; p.vy = -200; p.rot = 0; p.vr = 0;
-      }
-    }
-  }
-}
-function landPiece(p, pl, i) {
-  const h = S.cur;
-  // 大きな角材は、そばに高い塔があると転がって塔を崩す
-  if (!p.noroll && p.w * p.h >= 4) {
-    const tw = findTower(h, pl.c, p.w, pl.r);
-    if (tw) {
-      let c1 = tw.dir < 0 ? tw.tc + 1 : tw.tc - p.w;
-      c1 = clamp(c1, 0, COLS - p.w);
-      p.state = 'roll'; p.rc0 = pl.c; p.rc1 = c1; p.rr0 = pl.r; p.rt = 0; p.rdir = tw.dir; p.tower = tw;
-      p.rdur = 0.22 + 0.17 * Math.abs(c1 - pl.c);
-      sfx.knock(p.w * p.h); sfx.roll();
-      note('roll:' + pl.c + '->' + c1 + ' tower' + tw.tc);
-      return;
-    }
-  }
-  S.pieces.splice(i, 1);
-  if (pl.over || pl.r + p.h > ROWLIM) {
-    // 載りきらず転がり落ちる(床に残る)
-    addRubble(h, p.x, p.y - p.h * CELL / 2, p, Math.random() < 0.5 ? -1 : 1);
-    sfx.knock(p.w * p.h);
-    note('overflow');
+function cutStrand(s,at,dir,g){
+  const cl=s.len-at;if(cl<0.25)return;
+  s.len=at;s.sq=0.9;s.sv=2.2;s.wv+=dir*1.4;
+  const t=G.t;
+  G.combo=(t-G.lastCut<1.3)?Math.min(G.combo+1,10):0;G.lastCut=t;G.ev.cuts++;
+  SND.snip(1+G.combo*0.035+(s.g==='mus'?0.15:0));
+  // cut point & piece centre
+  const cpx=g.x+g.dx*at*U, cpy=g.y+g.dy*at*U, mid=(at+cl/2)*U;
+  const PX=wx(g.x+g.dx*mid),PY=wy(g.y+g.dy*mid);
+  const col=(s.g==='beard')?PAL.beard:PAL.hair;
+  for(let k=0;k<4;k++)addPart(wx(cpx),wy(cpy),rnd(-2,2)+dir*1.5,rnd(1,4),col,rnd(0.12,0.22),rnd(0.5,0.9));
+  // reactions
+  if(s.g==='beard'){UN.shrug=1.0;if(t-(UN.lastShrug||-9)>1.2){SND.shrug();UN.lastShrug=t;}G.ev.shrug++;}
+  else if(s.g==='mus'){UN.laugh=1.5;hd.rv+=0.4*dir;if(t-(UN.lastLaugh||-9)>1.0){SND.giggle();UN.lastLaugh=t;}G.ev.laugh++;}
+  else {UN.blinkQ=Math.max(UN.blinkQ,1);}
+  G.mirrorAt=t+1.4;
+  // piece
+  const sid=stroke?stroke.id:-1;
+  if(s.g==='mus'){
+    let p=G.pieces.find(q=>q.type==='eave'&&q.sid===sid&&q.state==='fall'&&t-q.t0<0.4);
+    if(p){p.len+=cl;p.tw=Math.min(3.2,0.6+p.len*0.4);}
+    else G.pieces.push({type:'eave',sid,len:cl,X:PX,Y:PY,vx:dir*0.8,vy:2.5,ang:-g.A,va:dir*3,w:0.7,h:cl,tw:0.6+cl*0.4,th:0.32,
+      col:tint(PAL.hair,0.85),t0:t,state:'fall',dir});
     return;
   }
-  const b = placeBlock(h, p, pl.c, pl.r);
-  b.ry = pl.r;
-  sfx.knock(p.w * p.h);
-  burst(p.x, p.y, Math.min(6, 2 + p.w * p.h), 'dust', '#e8ddc6');
-  updateTilt(h);
-  S.targetCool = 0;
-  note('land:' + p.w + 'x' + p.h + '@' + b.c + ',' + b.r);
-}
-
-/* ---------- 完成 ---------- */
-function allCut() { return S.tufts.every(t => t.len <= t.stub); }
-function startComplete() {
-  const h = S.cur, u = S.uncle;
-  S.mode = 'complete';
-  S.demo = null;
-  h.leftH = wallH(h, -1); h.rightH = wallH(h, 1); h.topH = restMax(h);
-  note('complete:L' + h.leftH + ':R' + h.rightH + ':top' + h.topH);
-  const bl = h.blocks.slice().sort((a, b) => a.order - b.order);
-  const n = bl.length, step = Math.min(0.09, 1.5 / Math.max(1, n));
-  bl.forEach((b, i) => after(0.15 + i * step, () => { b.pop = 1; sfx.click(i % 14); }));
-  let t = 0.15 + n * step + 0.3;
-  const doorX = () => X0(h) + (DOORC + 0.5) * CELL;
-  after(t, () => { h.glow = 1; u.ty = 54; u.bowT = 0.6; S.hands[1].g = { x: doorX() + 6, y: L.base - 1.1 * CELL }; u.expr = 'happy'; u.exprT = 1; });
-  after(t + 0.75, () => { h.doorWob = 1; sfx.bump(); u.expr = 'shy'; u.exprT = 1.6; u.blush = 1.4; S.hands[1].g = { x: doorX() + 22, y: L.base - 1.6 * CELL }; });
-  after(t + 1.45, () => { u.ty = 0; u.bowT = 0; S.hands[1].g = null; S.hands[0].g = { x: -L.mirrorX, y: L.headTop + 46 }; });
-  after(t + 1.95, () => { S.hat.state = 'carry'; sfx.pop(); S.hands[0].g = { x: h.cx - 20, y: L.base - h.topH * CELL - 120 }; });
-  after(t + 2.6, () => {
-    S.hands[0].g = null;
-    S.hat.state = 'fly';
-    S.hat.fly = { t: 0, x0: S.hat.x, y0: S.hat.y, x1: h.cx, y1: L.base - h.topH * CELL };
-  });
-  after(t + 3.05, () => {
-    S.hat.state = 'none';
-    h.roof = { y: L.base - h.topH * CELL, pop: 1 };
-    h.done = true;
-    sfx.fanfare();
-    burst(h.cx, L.base - h.topH * CELL - 20, 16, 'spark', '#ffffff');
-    burst(h.cx, L.base - h.topH * CELL - 20, 10, 'spark', P.ver.f);
-    u.expr = 'proud'; u.exprT = 1.8; u.bowT = 1;
-    note('roof');
-  });
-  after(t + 3.9, () => { u.bowT = 0; });
-  let t2 = t + 4.1;
-  const prev = S.houses.length > 1 ? S.houses[S.houses.length - 2] : null;
-  if (prev) {
-    after(t2, () => {
-      const H1 = prev.rightH, H2 = h.leftH, type = Math.abs(H1 - H2) <= 1 ? 'bridge' : 'stairs';
-      h.conn = { type, H1, H2, prog: 0, n: Math.max(1, Math.abs(H1 - H2)), last: -1 };
-      if (type === 'bridge') sfx.bridge();
-      note('connect:' + type + ':' + H1 + '->' + H2);
-    });
-    t2 += 1.6;
+  let cl2=cl;
+  if(cl<0.5){s.dust+=cl;if(s.dust<0.85)return;cl2=s.dust;s.dust=0;}
+  const pcol=tint(col,rnd(0.93,1.06));
+  if(cl2<1.7){
+    G.pieces.push({type:'small',sid,cmin:s.col,cmax:s.col,vox:cl2,n:1,X:PX,Y:PY,vx:dir*1.2,vy:rnd(1.5,3),ang:-g.A,va:dir*rnd(4,8),
+      w:s.wd,h:cl2,tw:1,th:1,col:pcol,t0:t,state:'fall',dir,g:s.g});
+    return;
   }
-  after(t2, () => { S.mode = 'choose'; S.shelfT = 1; S.suggest = suggestWig(); S.idle = 0; S.demoAt = 4; });
+  // thick: merge with a chunk from the same stroke if adjacent
+  let p=G.pieces.find(q=>q.type==='big'&&q.sid===sid&&q.state==='fall'&&t-q.t0<0.3&&s.col>=q.cmin-1&&s.col<=q.cmax+1&&((q.g==='beard')===(s.g==='beard')));
+  if(p){p.cmin=Math.min(p.cmin,s.col);p.cmax=Math.max(p.cmax,s.col);p.vox+=cl;p.n++;p.X=(p.X*(p.n-1)+PX)/p.n;p.Y=Math.max(p.Y,PY);
+    setBigDims(p);}
+  else{p={type:'big',sid,cmin:s.col,cmax:s.col,vox:cl,n:1,X:PX,Y:PY,vx:dir*1.4,vy:rnd(2,3.2),ang:-g.A,va:dir*rnd(3,6),
+      w:s.wd,h:cl,tw:1,th:1,col:pcol,t0:t,state:'fall',dir,g:s.g};setBigDims(p);G.pieces.push(p);}
 }
-function suggestWig() {
-  // 前の家より低くなりそうな短いかつら → 次は同じくらい → 長い と順に誘う(選ぶのは自由)
-  return [0, 1, 2][S.cycle % 3];
-}
-function pickWig(i) {
-  if (S.mode !== 'choose') return;
-  S.mode = 'trans';
-  const wp = wigPos(i);
-  S.wigFly = { i, t: 0, x0: wp.x, y0: wp.y, x1: S.uncle.x, y1: headTop() - 1.2 * V };
-  S.wob.shelf[i] = 1;
-  sfx.wig();
-  note('wig:' + i);
-  after(0.55, () => {
-    const spec = WIGS[i];
-    S.wigSpec = spec; S.uncle.hairCol = spec.hair;
-    S.tufts = makeTufts(spec, true);
-    S.uncle.seen = [false, false];
-    S.wigFly = null; S.shelfT = 0;
-    sfx.grow();
-    S.cycle++;
-    const h = newHouse(0);
-    S.houses.push(h);
-    S.cur = h;
-    while (S.houses.length > 3) S.houses.shift();
-    placeHouses(false);
-    h.cx = h.tcx + LW * 0.7;
-    S.hat = { state: 'hook', x: 0, y: 0, drop: 1, fly: null };
-    after(0.9, () => { S.mode = 'build'; S.idle = 0; S.demoAt = 4; S.targetCool = 0; });
-  });
-}
+function setBigDims(p){const w=p.cmax-p.cmin+1;p.tw=w;p.th=clamp(Math.round(p.vox/w/1.5),1,3);}
 
-/* ---------- 誘導 (次に触る物は1つだけ) ---------- */
-function coversEye(t) { return t.kind === 'bang' && Math.abs(t.x) >= 1 && t.len > 2; }
-function eyeHidden(i) {
-  const sx = i === 0 ? -1 : 1;
-  return S.tufts.some(t => t.kind === 'bang' && Math.sign(t.x) === sx && Math.abs(t.x) >= 1 && t.disp > 2.05);
-}
-function computeTarget() {
-  if (S.mode === 'choose') return { type: 'wig', i: S.suggest };
-  if (S.mode !== 'build') return null;
-  const cand = S.tufts.filter(t => t.len > t.stub);
-  if (!cand.length) return null;
-  const longest = arr => arr.reduce((a, b) => (b.len - b.stub > a.len - a.stub || (b.len - b.stub === a.len - a.stub && Math.abs(b.x) > Math.abs(a.x))) ? b : a);
-  const cov = cand.filter(coversEye);
-  if (cov.length) return { type: 'tuft', t: longest(cov) };
-  const h = S.cur;
-  const d = wallH(h, -1) - wallH(h, 1);
-  const nonMus = cand.filter(t => t.kind !== 'mus');
-  if (Math.abs(d) >= 2 && nonMus.length) {
-    const want = d > 0 ? 1 : -1;
-    const side = nonMus.filter(t => Math.sign(t.x) === want);
-    if (side.length) return { type: 'tuft', t: longest(side) };
+// ---------- landing / building ----------
+function addAnim(h,id,ox,oy,dur){h.anim.set(id,{t:0,ox,oy,dur:dur||0.14});}
+function place(h,c0,w,r0,hh,col,kind){const id=h.nextId++;let n=0;
+  for(let r=r0;r<r0+hh;r++)for(let c=c0;c<c0+w;c++){if(r>=MAXH||r<0||c<0||c>=COLS)continue;
+    if(h.cells[r][c])continue;h.cells[r][c]={id,col,k:kind};h.win.delete(r*COLS+c);n++;}
+  return id;}
+function land(p){
+  const h=G.house;G.ev.landed++;
+  if(p.type==='small'){
+    let c=p.cmin;
+    for(let i=0;i<3;i++){const t=topOf(h,c),tl=c>0?topOf(h,c-1):-9,tr=c<7?topOf(h,c+1):-9;
+      const cand=[];if(c>0&&t-tl>=3)cand.push([tl,c-1]);if(c<7&&t-tr>=3)cand.push([tr,c+1]);
+      if(!cand.length)break;cand.sort((a,b)=>a[0]-b[0]||((b[1]-c)*p.dir-(a[1]-c)*p.dir));c=cand[0][1];}
+    const t=topOf(h,c);let r=t;
+    if(c>0&&c<7){const tl=topOf(h,c-1),tr=topOf(h,c+1),m=Math.min(tl,tr);
+      if(m-t>=2){r=m-1;for(let k=t;k<r;k++)h.win.add(k*COLS+c);G.ev.window++;SND.glint();
+        for(let k=0;k<5;k++)addPart(c+0.5,t+0.5,rnd(-1,1),rnd(0.5,2),PAL.white,0.12,0.6,0.2);}}
+    if(r>=MAXH){overflow(p);return;}
+    const id=place(h,c,1,r,1,p.col,'s');addAnim(h,id,p.X-(c+0.5),-(p.Y-(r+0.5)));
+    SND.land(1);puff(c+0.5,r,3);afterChange(h);return;
   }
-  const order = ['beard', 'side', 'bang'];
-  const mus = cand.filter(t => t.kind === 'mus');
-  if (mus.length && (h.blocks.length >= 7 || !nonMus.length)) return { type: 'tuft', t: mus[0] };
-  for (const k of order) {
-    const c = cand.filter(t => t.kind === k);
-    if (c.length) {
-      // 低い側の壁に落ちる房を優先
-      const lowSide = d > 0 ? 1 : d < 0 ? -1 : 0;
-      const pref = lowSide ? c.filter(t => Math.sign(t.x) === lowSide) : [];
-      return { type: 'tuft', t: longest(pref.length ? pref : c) };
+  if(p.type==='big'){
+    const w=p.tw,hh=p.th,c0=p.cmin;let rest=0;
+    for(let c=c0;c<c0+w;c++)rest=Math.max(rest,topOf(h,c));
+    // tower crush: a wide heavy block landing on a thin tall spike
+    if(w>=3&&w*hh>=6){const tops=[];for(let c=c0;c<c0+w;c++)tops.push(topOf(h,c));
+      const sup=tops.filter(v=>v===rest).length;const second=Math.max(0,...tops.filter(v=>v<rest));
+      if(rest>0&&sup<=Math.max(1,Math.floor(w/3))&&rest-second>=2){
+        const ks=[];for(let c=c0;c<c0+w;c++)if(topOf(h,c)===rest)for(let r=second;r<rest;r++)if(h.cells[r][c])ks.push([r,c]);
+        knock(h,ks,(c0+w/2)<4?1:-1,true);G.ev.tower++;SND.crash();UN.sur=1.2;UN.surBig=1;
+        rest=0;for(let c=c0;c<c0+w;c++)rest=Math.max(rest,topOf(h,c));}}
+    // heavy block: tips toward a neighbouring tower, or rolls off uneven ground
+    let rdir=0,steps=0;
+    if(w*hh>=6){
+      const tl=c0>0?topOf(h,c0-1):-9,tr=c0+w<COLS?topOf(h,c0+w):-9;
+      if(tr-rest>=3&&tr>=tl){rdir=1;steps=1;}else if(tl-rest>=3){rdir=-1;steps=1;}
+      else{let sup=0,lo=0,hi=0;for(let c=c0;c<c0+w;c++){const v=topOf(h,c);if(v===rest)sup++;if(c<c0+w/2)lo+=v;else hi+=v;}
+        if(sup<w/2&&lo!==hi){rdir=lo<hi?-1:1;steps=w*hh>=14?3:2;}}
     }
+    if(rdir){
+      G.rolling.push({p,c0,rest,w,hh,steps,dir:rdir,timer:0.22,fx:c0,fy:rest,t:0,ang:0,hop:0,
+        X:p.X,Y:p.Y,col:p.col});
+      G.ev.roll++;SND.land(w*hh);puff(c0+w/2,rest,6);return;
+    }
+    finalizeBig(h,c0,w,hh,rest,p.col,p.X,p.Y);return;
   }
-  return { type: 'tuft', t: mus[0] || cand[0] };
+}
+function finalizeBig(h,c0,w,hh,rest,col,fromX,fromY){
+  let hh2=hh;if(rest+hh>MAXH){hh2=Math.max(0,MAXH-rest);
+    for(let k=0;k<(hh-hh2)*w;k++)spawnRubble(c0+(k%w)+0.5,MAXH+0.5,rnd(-4,4),rnd(2,4),col);
+    UN.sur=0.8;}
+  if(hh2>0){const id=place(h,c0,w,rest,hh2,col,'b');addAnim(h,id,fromX-(c0+w/2),-(fromY-(rest+hh2/2)),0.12);}
+  SND.land(w*hh);puff(c0+w/2,rest,5);afterChange(h);
+}
+function overflow(p){spawnRubble(p.cmin+0.5,MAXH,rnd(-4,4),rnd(2,4),p.col);SND.land(1);}
+function puff(X,Y,n){for(let k=0;k<n;k++)addPart(X+rnd(-0.5,0.5),Y+0.1,rnd(-2.5,2.5),rnd(0.5,2),PAL.cream,rnd(0.12,0.2),rnd(0.3,0.5),0.5);}
+function knock(h,list,dir,big){
+  for(const [r,c] of list){const cell=h.cells[r][c];if(!cell)continue;h.cells[r][c]=null;
+    const tn=Math.tan(h.tilt);spawnRubble(c+0.5+tn*(r+0.5),r+0.5,dir*rnd(2.5,5.5)+(c-3.5)*0.25,rnd(2,5),cell.col);}
+  for(const k of Array.from(h.win)){const r=Math.floor(k/COLS),c=k%COLS;if(topOf(h,c)<=r||h.cells[r][c])h.win.delete(k);}
+}
+function spawnRubble(X,Y,vx,vy,col){const h=G.house;
+  if(h.rubble.length>=MAXRUB){const i=h.rubble.findIndex(r=>r.state==='rest');if(i>=0)h.rubble.splice(i,1);else return;}
+  h.rubble.push({X,Y,vx,vy,ang:0,va:rnd(-9,9),col,z:0,vz:rnd(0.6,1.6),state:'fly',bounce:0});}
+function afterChange(h){
+  // tilt from weight distribution
+  let m=0,mx=0;for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){const e=h.cells[r][c];if(!e)continue;const wgt=e.k==='b'?1.5:1;m+=wgt;mx+=wgt*(c+0.5-4);}
+  const o=mx/(m+8);const ht=houseHeight(h);
+  h.tiltT=clamp(o*0.085,-0.3,0.3);
+  const big=Math.abs(o)>0.75&&m>=8;
+  if(big&&!h.tiltBig){G.ev.tilt++;SND.creak();UN.sur=Math.max(UN.sur,0.6);}
+  if(!big&&h.tiltBig){G.ev.tiltFix++;SND.settle();for(let k=0;k<6;k++)addPart(rnd(0,8),0.2,rnd(-1,1),rnd(1,2.5),PAL.mint,0.16,0.7,0.3);}
+  h.tiltBig=big;
+  if(Math.abs(o)>1.6&&ht>=4&&m>=16&&h.collapseCD<=0){
+    const from=Math.floor(ht/2);const ks=[];
+    for(let r=ROWS-1;r>=from;r--)for(let c=0;c<COLS;c++)if(h.cells[r][c])ks.push([r,c]);
+    knock(h,ks,Math.sign(o),false);G.ev.collapse++;SND.crash();UN.sur=1.4;UN.surBig=1;h.collapseCD=1.5;
+    UN.laugh=Math.max(UN.laugh,1.0);
+    afterChange(h);return;
+  }
+  const H2=houseHeight(h);
+  if(G.town.length&&Math.abs(H2-G.town[0].height)<=1&&H2>0){if(h.ledgeGlow<=0.05){h.ledgeGlow=1.2;SND.glint();}}
 }
 
-/* ---------- 入力 ---------- */
-function onDown(e) {
-  if (e.cancelable) e.preventDefault();
-  initAudio();
-  const p = toL(e);
-  S.rings.push({ x: p.x, y: p.y, t: 0 }); if (S.rings.length > 6) S.rings.shift();
-  S.idle = 0; S.demoAt = 4; S.demo = null;
-  if (S.active) return;                       // 2本目以降の指は無視
-  S.active = { id: e.pointerId, x: p.x, y: p.y, travel: 0, cut: new Set(), group: null };
-  try { cv.setPointerCapture(e.pointerId); } catch (_) {}
-  S.trail.length = 0; S.trail.push({ x: p.x, y: p.y, t: S.t });
-  tapAt(p.x, p.y);
-}
-function onMove(e) {
-  const a = S.active;
-  if (!a || e.pointerId !== a.id) return;
-  if (e.cancelable) e.preventDefault();
-  let evs = (e.getCoalescedEvents && e.getCoalescedEvents()) || null;
-  if (!evs || !evs.length) evs = [e];
-  for (const ev of evs) {
-    const p = toL(ev);
-    if (Math.abs(p.x - a.x) + Math.abs(p.y - a.y) < 0.5) continue;
-    if (S.mode === 'build') cutSegment(a.x, a.y, p.x, p.y);
-    a.x = p.x; a.y = p.y;
-    S.trail.push({ x: p.x, y: p.y, t: S.t });
-  }
-  if (S.trail.length > 40) S.trail.splice(0, S.trail.length - 40);
-  S.idle = 0;
-}
-function onUp(e) {
-  if (!S.active || e.pointerId !== S.active.id) return;
-  endStroke();
-}
-function endStroke() {
-  if (!S.active) return;
-  try { cv.releasePointerCapture(S.active.id); } catch (_) {}
-  S.active = null;
-  S.idle = 0;
-}
-cv.addEventListener('pointerdown', onDown, { passive: false });
-cv.addEventListener('pointermove', onMove, { passive: false });
-cv.addEventListener('pointerup', onUp);
-cv.addEventListener('pointercancel', onUp);
-cv.addEventListener('lostpointercapture', onUp);
-['contextmenu', 'selectstart', 'dblclick', 'gesturestart', 'gesturechange', 'gestureend'].forEach(n =>
-  document.addEventListener(n, e => { if (e.cancelable) e.preventDefault(); }, { passive: false }));
-document.addEventListener('touchmove', e => { if (e.cancelable) e.preventDefault(); }, { passive: false });
-document.addEventListener('touchstart', e => { if (e.touches && e.touches.length > 1 && e.cancelable) e.preventDefault(); }, { passive: false });
-window.addEventListener('resize', layout);
-window.addEventListener('orientationchange', () => setTimeout(layout, 120));
-window.addEventListener('blur', endStroke);
-
-/* ---------- 更新 ---------- */
-function update(dt) {
-  S.t += dt;
-  for (let i = 0; i < S.timers.length; i++) {
-    const tm = S.timers[i];
-    if (tm.t <= S.t) { S.timers.splice(i, 1); i--; try { tm.fn(); } catch (e) { console.warn(e); } }
-  }
-  if (!S.active) S.idle += dt;
-  updateUncle(dt);
-  updateTufts(dt);
-  updatePieces(dt);
-  updateHouses(dt);
-  updateFx(dt);
-  // 誘導
-  S.targetCool -= dt;
-  if (S.targetCool <= 0) { S.target = computeTarget(); S.targetCool = 0.4; }
-  if ((S.mode === 'build' || S.mode === 'choose') && !S.active && S.target && !S.demo && S.idle >= S.demoAt) {
-    startDemo();
-    S.demoAt = S.idle + 12;  // 連続して催促しない
-  }
-  if (S.demo) { S.demo.t += dt; if (S.demo.t >= S.demo.dur || S.active) S.demo = null; }
-  // 完成
-  if (S.mode === 'build' && !S.compPending && allCut() && S.pieces.length === 0) {
-    S.compPending = true;
-    after(0.45, () => {
-      S.compPending = false;
-      if (S.mode === 'build' && allCut() && S.pieces.length === 0) startComplete();
-    });
-  }
-}
-function startDemo() {
-  const tg = S.target;
-  if (tg.type === 'tuft') {
-    const g = tuftGeo(tg.t);
-    const y = clamp(g.tip - 0.7 * V, g.root + (tg.t.stub + 0.5) * V, g.tip);
-    S.demo = { type: 'swipe', t: 0, dur: 1.5, x0: g.x - 70, x1: g.x + 70, y };
-  } else if (tg.type === 'wig') {
-    const p = wigPos(tg.i);
-    S.demo = { type: 'tap', t: 0, dur: 1.5, x0: p.x, y: p.y + 50 };
-  }
-}
-function updateUncle(dt) {
-  const u = S.uncle;
-  u.x += (u.tx - u.x) * Math.min(1, dt * 6);
-  u.y += (u.ty - u.y) * Math.min(1, dt * 5);
-  u.bow += (u.bowT - u.bow) * Math.min(1, dt * 6);
-  if (u.exprT > 0) { u.exprT -= dt; if (u.exprT <= 0) u.expr = 'neutral'; }
-  u.shrug = Math.max(0, u.shrug - dt * 1.6);
-  u.laugh = Math.max(0, u.laugh - dt);
-  u.blush = Math.max(0, u.blush - dt * 0.8);
-  u.bounce = Math.max(0, u.bounce - dt * 2.5);
-  // 目が見えたら ぱちぱち
-  for (let i = 0; i < 2; i++) {
-    const vis = !eyeHidden(i);
-    if (vis && !u.seen[i] && S.mode !== 'trans') {
-      u.seen[i] = true; u.burst[i] = 0.7; sfx.blink(); note('eye' + i + ':open');
+// ---------- updates ----------
+function updatePieces(dt){
+  const h=G.house;
+  for(let i=G.pieces.length-1;i>=0;i--){const p=G.pieces[i];
+    p.w=lerp(p.w,p.tw,Math.min(1,dt*9));p.h=lerp(p.h,p.th,Math.min(1,dt*9));
+    p.vy-=GRAV*dt;p.Y+=p.vy*dt;p.ang+=p.va*dt;p.va*=(1-dt*1.2);
+    if(p.type==='eave'){
+      p.X=lerp(p.X,4,Math.min(1,dt*4));
+      const ty=2.3;if(p.Y<=ty+0.2&&p.vy<0){h.eave=Math.min(14,h.eave+p.len);G.ev.eave++;SND.land(0.8);SND.click(4);puff(4,2,4);
+        G.pieces.splice(i,1);continue;}
+      p.dist=p.Y-ty;continue;
     }
-    if (!vis) u.seen[i] = false;
-    u.burst[i] = Math.max(0, u.burst[i] - dt);
-  }
-  u.blinkT -= dt;
-  if (u.blinkT <= 0) { u.blink = 0.13; u.blinkT = rand(2.2, 4.5); }
-  u.blink = Math.max(0, u.blink - dt);
-  // 視線
-  let lx = 0, ly = 700;
-  const tg = S.target;
-  if (tg && tg.type === 'tuft') { const g = tuftGeo(tg.t); lx = g.x; ly = g.tip + 10; }
-  else if (tg && tg.type === 'wig') { const p = wigPos(tg.i); lx = p.x; ly = p.y; }
-  if (S.mirrorAt && S.t >= S.mirrorAt && S.mode === 'build') { u.mirrorT = 0.9; S.mirrorAt = 0; }
-  if (u.mirrorT > 0) { u.mirrorT -= dt; lx = L.mirrorX; ly = L.headTop + 40; }
-  if (S.mode === 'complete' && S.cur) { lx = S.cur.cx; ly = L.base - 60; }
-  u.lx += (lx - u.lx) * Math.min(1, dt * 8); u.ly += (ly - u.ly) * Math.min(1, dt * 8);
-  u.mirror += ((u.mirrorT > 0 ? 1 : 0) - u.mirror) * Math.min(1, dt * 7);
-  // 片側のひげだけ短いと首をかしげる / 家が傾くと心配
-  let bl = 0, br = 0;
-  for (const t of S.tufts) if (t.kind === 'beard') { if (t.x < 0) bl += t.len; else if (t.x > 0) br += t.len; }
-  let tilt = clamp((br - bl) * 0.8, -4.5, 4.5);
-  if (S.cur && S.cur.tiltState) tilt += S.cur.tiltState * -1.5;
-  if (u.laugh > 0) tilt += Math.sin(S.t * 30) * 3 * Math.min(1, u.laugh);
-  u.tilt += (tilt - u.tilt) * Math.min(1, dt * 5);
-  // 待つ間は前髪をかき分ける
-  u.partCool -= dt;
-  if (S.mode === 'build' && u.partT <= 0 && u.partCool <= 0 && S.idle > 2.5 && !S.demo && (eyeHidden(0) || eyeHidden(1))) {
-    u.partT = 1.6; u.partCool = 7.5;
-  }
-  if (u.partT > 0) {
-    u.partT -= dt;
-    const k = 1 - u.partT / 1.6;
-    u.partAmt = Math.sin(clamp(k, 0, 1) * Math.PI);
-    S.hands[1].g = { x: u.x + 1.6 * V, y: headTop() + 2.6 * V };
-    if (u.partT <= 0) { u.partAmt = 0; S.hands[1].g = null; }
-    if (S.active) { u.partT = 0; u.partAmt = 0; S.hands[1].g = null; }
-  }
-  // 手
-  const top = headTop();
-  for (let i = 0; i < 2; i++) {
-    const hd = S.hands[i];
-    const dx = (i ? 1 : -1) * 6.3 * V + u.x, dy = top + 12.4 * V - u.shrug * 10;
-    const g = hd.g || { x: dx, y: dy };
-    hd.x += (g.x - hd.x) * Math.min(1, dt * 7);
-    hd.y += (g.y - hd.y) * Math.min(1, dt * 7);
-  }
-  // 帽子
-  const hat = S.hat;
-  if (hat.state === 'hook') { hat.x = -L.mirrorX; hat.y = L.headTop + 74; hat.drop = Math.max(0, hat.drop - dt * 2.2); }
-  else if (hat.state === 'carry') { hat.x = S.hands[0].x + 4; hat.y = S.hands[0].y - 6; }
-  else if (hat.state === 'fly' && hat.fly) {
-    const f = hat.fly; f.t = Math.min(1, f.t + dt / 0.45);
-    hat.x = lerp(f.x0, f.x1, f.t); hat.y = lerp(f.y0, f.y1, f.t) - Math.sin(f.t * Math.PI) * 50;
-  }
-  if (S.wigFly) S.wigFly.t = Math.min(1, S.wigFly.t + dt / 0.5);
-  S.shelf += (S.shelfT - S.shelf) * Math.min(1, dt * 6);
-  for (const k of ['mirror', 'hat', 'face']) S.wob[k] = Math.max(0, S.wob[k] - dt * 2.5);
-  for (let i = 0; i < 3; i++) S.wob.shelf[i] = Math.max(0, S.wob.shelf[i] - dt * 2.5);
-}
-function updateTufts(dt) {
-  const tg = S.target && S.target.type === 'tuft' ? S.target.t : null;
-  for (const t of S.tufts) {
-    const acc = -170 * t.sq - 11 * t.sqv;
-    t.sqv += acc * dt; t.sq += t.sqv * dt;
-    t.sq = clamp(t.sq, -0.35, 0.4);
-    if (t.disp < t.len) t.disp = Math.min(t.len, t.disp + dt * 7);
-    if (t.disp > t.len) t.disp = t.len;
-    if (t === tg && S.mode === 'build') {
-      const ph = (S.t % 1.5);
-      t.hop = ph < 0.36 ? Math.sin(ph / 0.36 * Math.PI) * 7 : 0;
-    } else t.hop *= Math.pow(0.02, dt);
-    t.part = (t.kind === 'bang' ? Math.sign(t.x) : 0) * S.uncle.partAmt;
+    const tx=p.cmin+p.tw/2;p.X+=(tx-p.X)*Math.min(1,dt*7);
+    let rest=0;for(let c=p.cmin;c<=p.cmin+p.tw-1;c++)rest=Math.max(rest,topOf(h,c));
+    p.dist=p.Y-p.h/2-rest;
+    if(p.dist<=0&&p.vy<0){p.Y=rest+p.th/2;G.pieces.splice(i,1);land(p);}
   }
 }
-function updateHouses(dt) {
-  for (const h of S.houses) {
-    h.cx += (h.tcx - h.cx) * Math.min(1, dt * 4.5);
-    h.tiltL += (h.tiltLT - h.tiltL) * Math.min(1, dt * 5);
-    h.tiltR += (h.tiltRT - h.tiltR) * Math.min(1, dt * 5);
-    h.doorWob = Math.max(0, h.doorWob - dt * 2);
-    h.wob = Math.max(0, h.wob - dt * 3);
-    h.glow = Math.max(0, h.glow - dt * 0.7);
-    if (h.roof) h.roof.pop = Math.max(0, h.roof.pop - dt * 3);
-    for (const b of h.blocks) {
-      b.land = Math.max(0, b.land - dt * 5);
-      b.pop = Math.max(0, b.pop - dt * 4);
-      b.ry += (b.r - b.ry) * Math.min(1, dt * 12);
-      if (Math.abs(b.ry - b.r) < 0.01) b.ry = b.r;
-    }
-    for (const r of h.rubble) {
-      if (r.rest) continue;
-      r.vy += 1700 * dt;
-      r.rx += r.vx * dt; r.y += r.vy * dt; r.rot += r.vr * dt;
-      const wx = h.cx + r.rx, lim = LW / 2 - 18;
-      if (h === S.cur && (wx < -lim || wx > lim)) { r.vx *= -0.5; r.rx = clamp(wx, -lim, lim) - h.cx; }
-      if (r.y >= r.fy && r.vy > 0) {
-        r.y = r.fy;
-        if (r.vy > 300) { r.vy *= -0.32; r.vx *= 0.5; r.vr *= 0.5; sfx.knock(2); }
-        else { r.rest = true; r.vy = 0; r.rot = Math.round(r.rot / (Math.PI / 2)) * (Math.PI / 2) + rand(-0.15, 0.15); }
-      }
-    }
-    if (h.conn && h.conn.prog < 1) {
-      h.conn.prog = Math.min(1, h.conn.prog + dt / 1.1);
-      const k = Math.floor(h.conn.prog * h.conn.n);
-      if (h.conn.type === 'stairs' && k !== h.conn.last && k < h.conn.n) { h.conn.last = k; sfx.step(k, h.conn.H2 > h.conn.H1); }
-      if (h.conn.prog >= 1) {
-        burst((X0(h) - GAP / 2), L.base - Math.max(h.conn.H1, h.conn.H2) * CELL, 12, 'spark', '#ffffff');
-        if (h.conn.type === 'stairs') sfx.windowChime();
-      }
-    }
+function updateRolling(dt){
+  const h=G.house;
+  for(let i=G.rolling.length-1;i>=0;i--){const R=G.rolling[i];R.t+=dt;
+    // approach the landing pose first
+    R.X=lerp(R.X,R.fx+R.w/2,Math.min(1,dt*10));R.Y=lerp(R.Y,R.fy+R.hh/2,Math.min(1,dt*10));
+    R.timer-=dt;R.hop=Math.max(0,R.hop-dt*5);
+    if(R.timer>0)continue;R.timer=0.2;
+    let stop=false;
+    if(R.steps<=0)stop=true;else{
+      const nc=R.c0+R.dir;
+      if(nc<0||nc+R.w>COLS)stop=true;else{
+        let nr=0;for(let c=nc;c<nc+R.w;c++)nr=Math.max(nr,topOf(h,c));
+        if(nr>R.rest){const lc=R.dir>0?nc+R.w-1:nc;const tl=topOf(h,lc);
+          if(tl-R.rest>=2){const ks=[];
+            for(const cc of [lc,lc+R.dir]){if(cc<0||cc>=COLS)continue;if(topOf(h,cc)-R.rest<2)continue;
+              for(let r=R.rest+1;r<ROWS;r++)if(h.cells[r][cc])ks.push([r,cc]);}
+            knock(h,ks,R.dir,true);G.ev.tower++;SND.crash();UN.sur=1.3;UN.surBig=1;afterChangeLite(h);}
+          else SND.tick();
+          stop=true;}
+        else{R.c0=nc;R.rest=nr;R.fx=nc;R.fy=nr;R.steps--;R.hop=1;R.ang+=R.dir*Math.PI/2;SND.roll();puff(nc+R.w/2,nr,2);}
+      }}
+    if(stop){G.rolling.splice(i,1);finalizeBig(h,R.c0,R.w,R.hh,R.rest,R.col,R.X,R.Y);}
   }
-  // 古い家が画面外に出たら消す
-  while (S.houses.length > 2 && S.houses[0].cx < -LW / 2 - SPACING) S.houses.shift();
 }
-function updateFx(dt) {
-  for (let i = S.parts.length - 1; i >= 0; i--) {
-    const q = S.parts[i];
-    q.life -= dt;
-    if (q.life <= 0) { S.parts.splice(i, 1); continue; }
-    q.vy += (q.type === 'spark' ? 200 : 700) * dt;
-    q.x += q.vx * dt; q.y += q.vy * dt; q.rot += dt * 6;
+function afterChangeLite(h){const H2=houseHeight(h);void H2;}
+function updateRubble(dt){
+  const h=G.house;
+  for(const r of h.rubble){if(r.state!=='fly')continue;
+    r.vy-=GRAV*dt;r.X+=r.vx*dt;r.Y+=r.vy*dt;r.z=Math.min(1.8,r.z+r.vz*dt);r.ang+=r.va*dt;
+    if(r.X<-2.2){r.X=-2.2;r.vx=Math.abs(r.vx)*0.3;}if(r.X>10.2){r.X=10.2;r.vx=-Math.abs(r.vx)*0.3;}
+    if(r.Y<=0.4&&r.vy<0){r.Y=0.4;if(r.bounce<1){r.bounce++;r.vy=-r.vy*0.3;r.vx*=0.5;SND.land(1.2);}
+      else{r.state='rest';r.ang=Math.round(r.ang/(Math.PI/2))*(Math.PI/2)+rnd(-0.12,0.12);r.vx=r.vy=0;}}
   }
-  for (let i = S.rings.length - 1; i >= 0; i--) { S.rings[i].t += dt; if (S.rings[i].t > 0.35) S.rings.splice(i, 1); }
-  while (S.trail.length && S.t - S.trail[0].t > 0.22) S.trail.shift();
+  for(let i=h.rubble.length-1;i>=0;i--){const r=h.rubble[i];if(r.state!=='snap')continue;
+    r.st+=dt;const k=ease(r.st/0.3);r.X=lerp(r.sx0,r.tx,k);r.Y=lerp(r.sy0,r.ty,k)+Math.sin(k*Math.PI)*1.2;r.z=lerp(r.sz0,0,k);
+    if(r.st>=0.3){h.rubble.splice(i,1);if(r.tc>=0){const e=h.cells[r.tr][r.tc];if(!e||e.ghost){h.cells[r.tr][r.tc]=null;const id=place(h,r.tc,1,r.tr,1,r.col,'s');addAnim(h,id,0,0,0.05);}}}}
+}
+function updateHouse(h,dt){
+  h.collapseCD-=dt;h.ledgeGlow=Math.max(0,h.ledgeGlow-dt*0.5);
+  h.tiltV+=((h.tiltT-h.tilt)*40-h.tiltV*7)*dt;h.tilt+=h.tiltV*dt;
+  h.wv+=(-h.wob*90-h.wv*8)*dt;h.wob+=h.wv*dt;
+  for(const [id,a] of h.anim){a.t+=dt;if(a.t>a.dur+0.28)h.anim.delete(id);}
+  for(let c=0;c<COLS;c++)h.flash[c]=Math.max(0,h.flash[c]-dt*2.5);
+  if(h.passage&&h.passage.prog<1){const P=h.passage;const n=P.n;const before=Math.floor(P.prog*n);
+    P.prog=Math.min(1,P.prog+dt/(n*0.16+0.2));const after=Math.floor(P.prog*n);
+    for(let i=before;i<after&&i<n;i++){if(P.type==='stairs')SND.step(i,P.hc>P.hp);else SND.bridge(i);}
+    if(P.prog>=1){if(P.type==='bridge')SND.chime();else SND.fanfare();}}
+}
+function updateParticles(dt){
+  for(let i=G.parts.length-1;i>=0;i--){const p=G.parts[i];p.life-=dt;if(p.life<=0){G.parts.splice(i,1);continue;}
+    p.vy-=GRAV*0.5*p.grav*dt;p.X+=p.vx*dt;p.Y+=p.vy*dt;p.ang+=dt*4;if(p.Y<0.05){p.Y=0.05;p.vy=0;p.vx*=0.8;}}
+  for(let i=G.trail.length-1;i>=0;i--)if(G.t-G.trail[i].t>0.28)G.trail.splice(i,1);
+}
+function updateStrands(dt){
+  for(const s of G.strands){
+    s.sv+=((1-s.sq)*140-s.sv*11)*dt;s.sq+=s.sv*dt;
+    s.wv+=(-s.wob*55-s.wv*5.5)*dt;s.wob+=s.wv*dt;
+    if(s.gk<1){s.gk=Math.min(1,s.gk+dt*2.2);}
+    s.glow=Math.max(0,s.glow-dt*2);
+  }
+  const inv=G.invite;
+  if(inv&&G.phase==='play'){inv.glow=0.55+0.25*Math.sin(G.t*5);
+    const ph=(G.t%1.7);if(ph<dt*1.01){inv.wv+=1.6*(Math.random()<0.5?-1:1);inv.sq=0.9;inv.sv=1.2;}}
+}
+function eyeCovered(i){const cols=i===0?[1,2]:[5,6];
+  return G.strands.some(s=>s.g==='bang'&&cols.includes(s.col)&&s.ay+s.len*s.gk>2.85);}
+function updateUncle(dt){
+  const t=G.t;
+  UN.sur=Math.max(0,UN.sur-dt);UN.laugh=Math.max(0,UN.laugh-dt);UN.shrug=Math.max(0,UN.shrug-dt*1.2);
+  UN.sheep=Math.max(0,UN.sheep-dt);UN.proud=Math.max(0,UN.proud-dt);UN.mirror=Math.max(0,UN.mirror-dt);
+  if(UN.sur<=0)UN.surBig=0;
+  // eyes revealed?
+  for(let i=0;i<2;i++){const cov=eyeCovered(i);
+    if(UN.eyeCov[i]&&!cov&&G.phase==='play'){UN.blinkQ=2;UN.sur=Math.max(UN.sur,1.3);G.ev.eyes++;SND.blink();
+      const p=H2S(i?6:2,3.2);for(let k=0;k<5;k++)addPart(wx(p[0]),wy(p[1]),rnd(-2,2),rnd(1,3),PAL.white,0.13,0.6,0.3);}
+    UN.eyeCov[i]=cov;}
+  // blinking
+  if(UN.blinkT>=0){UN.blinkT+=dt;if(UN.blinkT>0.13){UN.blinkT=-1;UN.nextBlink=UN.blinkQ>0?0.1:rnd(2.2,4.5);}}
+  else{UN.nextBlink-=dt;if(UN.nextBlink<=0||(UN.blinkQ>0&&UN.nextBlink>0.12)){UN.blinkT=0;if(UN.blinkQ>0)UN.blinkQ--;}}
+  // beard asymmetry → head tilt
+  let L=0,R=0;for(const s of G.strands)if(s.g==='beard'){if(s.col<4)L+=s.len;else R+=s.len;}
+  const d=R-L;let asym=Math.abs(d)>3.2?clamp(d*0.03,-0.17,0.17):0;
+  if(asym!==0&&UN.asym===0&&G.phase==='play'){SND.hm();G.ev.hm++;}
+  UN.asym=asym;
+  // mirror glance
+  if(G.mirrorAt>0&&t>G.mirrorAt&&t-G.lastCut>1.2&&G.phase==='play'){UN.mirror=1.4;G.mirrorAt=-1;G.ev.mirror++;G.mirror.wv+=0.6;}
+  // parting the bangs while waiting
+  const idle=t-G.lastInput;
+  if(G.phase==='play'&&!UN.partDone&&idle>2.6&&(UN.eyeCov[0]||UN.eyeCov[1])&&UN.partT<0){UN.partT=0;UN.partDone=true;G.ev.part++;}
+  if(UN.partT>=0){UN.partT+=dt;const k=UN.partT;
+    let hx,hy;if(k<0.4){const e=ease(k/0.4);hx=lerp(5,1.6,e);hy=lerp(10,19.6,e);}
+    else if(k<1.2){const e=ease((k-0.4)/0.8);hx=lerp(1.6,6.6,e);hy=19.6+Math.sin(e*Math.PI)*0.3;}
+    else{const e=ease((k-1.2)/0.4);hx=lerp(6.6,5,e);hy=lerp(19.6,10,e);}
+    UN.hand={X:hx,Y:hy-hd.dy};
+    if(k>0.4&&k<1.2)for(const s of G.strands)if(s.g==='bang'){const dx=(s.ax)-hx;if(Math.abs(dx)<1.1)s.wob=lerp(s.wob,dx<0?-0.55:0.55,0.25);}
+    if(k>1.6){UN.partT=-1;UN.hand=null;}
+  }
+  // crouch / bow (completion)
+  let body=0,bow=0;
+  if(UN.crouchT>=0){UN.crouchT+=dt;const k=UN.crouchT;
+    if(k<0.8)body=ease(k/0.8)*4.2;
+    else if(k<1.0){body=4.2-Math.sin((k-0.8)/0.2*Math.PI)*0.6;if(!UN.bonked){UN.bonked=true;SND.bonk();UN.sur=0.4;
+      for(let i=0;i<6;i++)addPart(4+rnd(-1,1),G.house.height+1+rnd(0,1),rnd(-3,3),rnd(2,4),PAL.cream,0.18,0.7,0.6);}}
+    else if(k<1.7){body=4.2;UN.sheep=0.3;}
+    else if(k<2.2)body=4.2*(1-ease((k-1.7)/0.5));
+    else{UN.crouchT=-1;UN.bonked=false;}}
+  if(UN.bowT>=0&&UN.bowT!==undefined){UN.bowT+=dt;const k=UN.bowT;bow=Math.sin(clamp(k/0.8,0,1)*Math.PI)*0.9;if(k>0.8)UN.bowT=-1;}
+  UN.body=body;
+  // gaze
+  let gx=0,gy=0.25;const hc=H2S(4,3.2);
+  if(UN.mirror>0){gx=1;gy=-0.1;}
+  else if(G.phase==='play'&&G.invite){const g=sGeom(G.invite);const tx=g.x+g.dx*g.L*0.6,ty=g.y+g.dy*g.L*0.6;
+    const vx=tx-hc[0],vy=ty-hc[1],m=Math.hypot(vx,vy)||1;gx=vx/m;gy=vy/m;}
+  else if(G.phase==='choose'&&G.wigs.length){const wg=G.wigs[G.wigHL]||G.wigs[0];const vx=sx(wg.X)-hc[0],vy=sy(wg.Y)-hc[1],m=Math.hypot(vx,vy)||1;gx=vx/m;gy=vy/m;}
+  else if(G.phase==='complete'){gx=0;gy=1;}
+  UN.gx=lerp(UN.gx,gx,Math.min(1,dt*8));UN.gy=lerp(UN.gy,gy,Math.min(1,dt*8));
+  // head spring
+  let rotT=UN.asym+(UN.mirror>0?0.05:0);
+  if(UN.laugh>0)rotT+=Math.sin(t*28)*0.06*Math.min(1,UN.laugh);
+  hd.rv+=((rotT-hd.rot)*60-hd.rv*9)*dt;hd.rot+=hd.rv*dt;
+  hd.dx=lerp(hd.dx,UN.mirror>0?0.3:0,Math.min(1,dt*6));
+  UN.fv+=(-UN.faceWob*120-UN.fv*9)*dt;UN.faceWob+=UN.fv*dt;
+  hd.dy=body+bow+UN.faceWob*0.3-(UN.shrug>0?Math.sin(UN.shrug*Math.PI)*0.25:0);
+  // hat & mirror springs
+  const ht=G.hat;ht.wv+=(-ht.wob*90-ht.wv*6)*dt;ht.wob+=ht.wv*dt;ht.pop=Math.min(1,ht.pop+dt*3);
+  G.mirror.wv+=(-G.mirror.wob*90-G.mirror.wv*6)*dt;G.mirror.wob+=G.mirror.wv*dt;
+  if(ht.state==='fly'){ht.t+=dt;const k=ht.t;const h=G.house;
+    const hook={X:-2.5,Y:20.1},roof={X:4,Y:h.height+1.2};
+    if(k<0.35){const e=ease(k/0.35);UN.hand={X:lerp(5,hook.X+0.6,e),Y:lerp(10,hook.Y,e)};}
+    else if(k<1.25){const e=ease((k-0.35)/0.9);ht.X=lerp(hook.X,roof.X,e);ht.Y=lerp(hook.Y,roof.Y,e)+Math.sin(e*Math.PI)*2.5;ht.s=lerp(0.32,1,e);ht.ang=Math.sin(e*Math.PI*2)*0.3;
+      UN.hand={X:ht.X+0.8*(1-e),Y:ht.Y+0.6};}
+    else if(k<1.7){if(!h.roof){h.roof=1;SND.pop();SND.click(8);for(let i=0;i<10;i++)addPart(rnd(0,8),h.height+1,rnd(-3,3),rnd(2,5),PAL.ver,0.16,0.8,0.6);}
+      const e=ease((k-1.25)/0.45);UN.hand={X:lerp(4.8,5,e),Y:lerp(h.height+2.2,10,e)};}
+    else{ht.state='gone';UN.hand=null;}
+  }
+}
+function updateGuide(dt){
+  if(G.phase==='play'){
+    const list=G.strands.filter(cuttable);let inv=null;
+    if(list.length){
+      if(UN.eyeCov[0]||UN.eyeCov[1]){for(const s of list)if(s.g==='bang'&&[1,2,5,6].includes(s.col)&&(!inv||s.len>inv.len))inv=s;}
+      if(!inv&&G.invite&&list.includes(G.invite)&&G.invite.len>1.7)inv=G.invite;
+      if(!inv)for(const s of list)if(!inv||s.len>inv.len)inv=s;
+    }
+    G.invite=inv;
+  } else G.invite=null;
+  const idle=G.t-G.lastInput;
+  if(!G.demo&&!G.demoDone&&idle>4.2&&!stroke){
+    if(G.phase==='play'&&G.invite){const g=sGeom(G.invite);const a=Math.min(g.L*0.6,g.L-0.4*U);
+      const px=g.x+g.dx*a,py=g.y+g.dy*a;G.demo={kind:'swipe',t:0,x0:px-1.7*U,y0:py-0.1*U,x1:px+1.7*U,y1:py+0.15*U};G.demoDone=true;G.ev.demo++;}
+    else if(G.phase==='choose'&&G.wigs.length){const wg=G.wigs[G.wigHL];G.demo={kind:'tap',t:0,X:wg.X,Y:wg.Y};G.demoDone=true;G.ev.demo++;}
+  }
+  if(G.demo){G.demo.t+=dt;if(G.demo.t>1.6)G.demo=null;}
+}
+function checkComplete(){
+  if(G.strands.some(cuttable))return;
+  if(G.pieces.length||G.rolling.length)return;
+  if(G.house.rubble.some(r=>r.state!=='rest'))return;
+  startComplete();
 }
 
-/* ---------- 描画ヘルパ ---------- */
-function cube(x, y, w, h, d, c) {
-  const dx = d * 0.55, dy = d * 0.5;
-  ctx.fillStyle = c.t;
-  ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + dx, y - dy); ctx.lineTo(x + w + dx, y - dy); ctx.lineTo(x + w, y); ctx.closePath(); ctx.fill();
-  ctx.fillStyle = c.s;
-  ctx.beginPath(); ctx.moveTo(x + w, y); ctx.lineTo(x + w + dx, y - dy); ctx.lineTo(x + w + dx, y + h - dy); ctx.lineTo(x + w, y + h); ctx.closePath(); ctx.fill();
-  ctx.fillStyle = c.f; ctx.fillRect(x, y, w, h);
+// ---------- completion sequence ----------
+function startComplete(){
+  G.phase='complete';G.ev.complete++;const h=G.house;h.tiltT=0;
+  const S=[];let t=0.35;
+  const rb=h.rubble.filter(r=>r.state==='rest');
+  rb.forEach((r,i)=>{S.push({at:t,fn:()=>snapRubble(h,r,i)});t+=0.08;});
+  if(rb.length)t+=0.35;
+  for(let c=0;c<COLS;c++)S.push({at:t+c*0.08,fn:()=>{h.flash[c]=1;SND.click(c);h.wv+=0.4;}});
+  t+=COLS*0.08+0.2;
+  S.push({at:t,fn:()=>{h.height=houseHeight(h);h.door=1;SND.fanfare();UN.sur=0.7;
+    for(let i=0;i<16;i++)addPart(rnd(-0.5,8.5),rnd(0,h.height+1),rnd(-2,2),rnd(2,6),[PAL.mint,PAL.ver,PAL.cream][i%3],0.18,1.0,0.6);}});
+  t+=0.9;
+  S.push({at:t,fn:()=>{UN.crouchT=0;}});t+=2.3;
+  S.push({at:t,fn:()=>{G.hat.state='fly';G.hat.t=0;SND.whoosh();}});t+=1.8;
+  S.push({at:t,fn:()=>{UN.proud=1.4;UN.bowT=0;SND.settle();}});t+=1.1;
+  S.push({at:t,fn:()=>startPassage(h)});t+=0.1;
+  S.push({at:t,fn:()=>showWigs()});
+  G.seq={t:0,list:S,i:0};
 }
-function rect(x, y, w, h, col) { ctx.fillStyle = col; ctx.fillRect(x, y, w, h); }
-function shadow(x, y, w, len) {
-  ctx.fillStyle = 'rgba(28,36,50,0.26)';
-  ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w + len * 0.9, y - len * 0.35); ctx.lineTo(x + len * 0.9, y - len * 0.35); ctx.closePath(); ctx.fill();
+function snapRubble(h,r,i){
+  let best=-1,bt=99;
+  for(let c=0;c<COLS;c++){const tp=topOf(h,c);const sc=tp+Math.abs(c+0.5-clamp(r.X,0,8))*0.15;if(tp<MAXH&&sc<bt){bt=sc;best=c;}}
+  r.state='snap';r.st=0;r.sx0=r.X;r.sy0=r.Y;r.sz0=r.z;
+  if(best<0){r.tc=-1;r.tx=r.X;r.ty=r.Y;}else{r.tc=best;r.tr=topOf(h,best);r.tx=best+0.5;r.ty=r.tr+0.5;
+    // reserve the cell so following snaps stack
+    h.cells[r.tr][best]={id:-999,col:r.col,k:'s',ghost:true};}
+  SND.click(i%8);
+}
+function startPassage(h){
+  if(!G.town.length){G.seqHold=0.2;return;}
+  const hp=G.town[0].height,hc=houseHeight(h);h.height=hc;const d=Math.abs(hp-hc);
+  const type=d<=1?'bridge':'stairs';const n=type==='bridge'?5:d+1;
+  h.passage={type,hp,hc,n,prog:0};G.seqHold=n*0.16+0.9;
+  if(type==='bridge')G.ev.bridge++;else G.ev.stairs++;
+}
+function updateSeq(dt){
+  if(!G.seq)return;
+  if(G.seqHold>0){G.seqHold-=dt;return;}
+  const S=G.seq;S.t+=dt;
+  while(S.i<S.list.length&&S.t>=S.list[S.i].at){const a=S.list[S.i++];a.fn();if(G.seqHold>0)break;}
+  if(S.i>=S.list.length)G.seq=null;
 }
 
-/* ---------- 部屋 ---------- */
-function drawRoom() {
-  const hz = L.horizon;
-  rect(-LW, -200, LW * 2, hz + 200, BG);
-  // 腰板
-  rect(-LW, hz - 26, LW * 2, 26, '#62758a');
-  rect(-LW, hz - 28, LW * 2, 3, '#7f93a8');
-  // 床 (斜め上から見える)
-  rect(-LW, hz, LW * 2, LH - hz + 300, FLOOR);
-  ctx.fillStyle = FLOORLN;
-  for (let y = hz + 30, k = 0; y < LH + 200; y += 34 + k * 4, k++) ctx.fillRect(-LW, y, LW * 2, 2);
-  ctx.strokeStyle = FLOORLN; ctx.lineWidth = 2; ctx.beginPath();
-  for (let x = -LW - 400; x < LW + 400; x += 70) { ctx.moveTo(x, LH + 300); ctx.lineTo(x + (LH + 300 - hz) * 1.1, hz); }
-  ctx.stroke();
-  // 鏡
-  const mx = L.mirrorX, my = L.headTop - 2;
-  const wb = Math.sin(S.t * 30) * S.wob.mirror * 0.05;
-  ctx.save(); ctx.translate(mx, my); ctx.rotate(wb);
-  cube(-36, 0, 72, 108, 8, P.mint);
-  rect(-28, 8, 56, 92, '#a9bccb');
-  ctx.save(); ctx.beginPath(); ctx.rect(-28, 8, 56, 92); ctx.clip();
-  ctx.fillStyle = '#bccbd6'; ctx.beginPath(); ctx.moveTo(-28, 70); ctx.lineTo(10, 8); ctx.lineTo(24, 8); ctx.lineTo(-28, 90); ctx.closePath(); ctx.fill();
-  // 映り込み
-  ctx.save(); ctx.translate(0, 34); ctx.scale(-0.3 - S.uncle.mirror * 0.04, 0.3 + S.uncle.mirror * 0.04);
-  drawHeadCore(0, -4 * V, S.tufts, S.uncle.hairCol, false, true);
+// ---------- wigs & next cycle ----------
+const HL_SEQ=[0,0,2,1,1,2];
+function showWigs(){
+  G.phase='choose';G.wigHL=HL_SEQ[G.cycle%HL_SEQ.length];
+  G.wigs=[0,1,2].map(i=>({i,X:[0.9,4,7.1][i],Y:14.6,t:-i*0.12,sq:1,sv:0}));
+  G.lastInput=G.t;G.demoDone=false;SND.pop();
+}
+function chooseWig(i){
+  if(G.phase!=='choose')return;
+  const wg=G.wigs[i];G.phase='shift';G.ev.wig++;SND.pop();SND.whoosh();
+  G.shift={t:0,i,X:wg.X,Y:wg.Y,applied:false};
+}
+function updateShift(dt){
+  for(const w of G.wigs){w.t+=dt;w.sv+=((1-w.sq)*120-w.sv*9)*dt;w.sq+=w.sv*dt;}
+  if(G.phase==='choose'&&G.wigs.length){const w=G.wigs[G.wigHL];if((G.t%1.6)<dt*1.01){w.sq=0.86;w.sv=1;}}
+  const S=G.shift;if(!S)return;S.t+=dt;
+  if(S.t>=0.45&&!S.applied){S.applied=true;G.wig=S.i;G.strands=makeStrands(WIGS[S.i],0.02);UN.sur=0.8;SND.pop();
+    UN.eyeCov=[eyeCovered(0),eyeCovered(1)];
+    const p=H2S(4,0);for(let k=0;k<10;k++)addPart(wx(p[0])+rnd(-4,4),wy(p[1]),rnd(-3,3),rnd(1,4),PAL.hair,0.18,0.8,0.6);}
+  if(S.t>=1.65){
+    G.town.unshift(G.house);if(G.town.length>6)G.town.pop();
+    G.house=newHouse();G.hat={state:'hook',t:0,pop:0,wob:0,wv:0};SND.pop();
+    G.shift=null;G.wigs=[];G.phase='play';G.cycle++;G.lastInput=G.t;G.demoDone=false;UN.partDone=false;
+  }
+}
+function shiftE(){const S=G.shift;if(!S)return 0;return ease((S.t-0.45)/1.2);}
+
+// ---------- rendering ----------
+function drawBG(){
+  ctx.fillStyle=PAL.bg;ctx.fillRect(0,0,W,H);
+  const jY=floorY+DY*2.4;
+  ctx.fillStyle=PAL.bg2;const st=2*U;let x0=((foundX%st)+st)%st-st;
+  for(let x=x0;x<W;x+=st)ctx.fillRect(x,0,U,jY);
+  ctx.fillStyle=PAL.base;ctx.fillRect(0,jY-0.4*U,W,0.4*U);
+  ctx.fillStyle=PAL.floor;ctx.fillRect(0,jY,W,H-jY);
+  ctx.fillStyle=PAL.floor2;const lw=Math.max(1,U*0.07),k=DX/DY;
+  for(let X=Math.floor(-foundX/U)-4;X<(W-foundX)/U+4;X++){
+    const xb=sx(X)+(H-floorY)*k,xt=sx(X)+(jY-floorY)*k;
+    ctx.beginPath();ctx.moveTo(xt-lw/2,jY);ctx.lineTo(xt+lw/2,jY);ctx.lineTo(xb+lw/2,H);ctx.lineTo(xb-lw/2,H);ctx.fill();}
+  for(let dz=-1;dz<=4;dz++){const y=floorY-DY*dz*1.2;if(y>jY&&y<H)ctx.fillRect(0,y,W,lw);}
+}
+function drawMirror(){
+  const X=10.25,Y=18.4,ang=G.mirror.wob*0.2;
+  wbox(X,Y,1.9,3.1,ang,0.35,PAL.frame);
+  const cx=sx(X),cy=sy(Y);
+  ctx.save();ctx.translate(cx,cy);ctx.rotate(ang);
+  ctx.fillStyle=PAL.glass;ctx.fillRect(-0.75*U,-1.35*U,1.5*U,2.7*U);
+  ctx.beginPath();ctx.rect(-0.75*U,-1.35*U,1.5*U,2.7*U);ctx.clip();
+  // reflection of the current hairstyle (mirrored)
+  const look=UN.mirror>0?1:0;
+  drawMini(0,0.1*U+look*0.1*U,0.15,null,true);
+  ctx.fillStyle='rgba(255,255,255,0.35)';ctx.beginPath();ctx.moveTo(-0.75*U,-0.3*U);ctx.lineTo(0.2*U,-1.35*U);ctx.lineTo(0.55*U,-1.35*U);ctx.lineTo(-0.75*U,0.1*U);ctx.fill();
   ctx.restore();
-  ctx.restore();
-  ctx.restore();
-  // 帽子掛け
-  const hx = -L.mirrorX;
-  rect(hx - 4, L.headTop + 40, 8, 10, P.mint.s);
-  cube(hx - 3, L.headTop + 36, 6, 6, 6, P.mint);
-  if (S.hat.state === 'hook') {
-    const wb2 = Math.sin(S.t * 28) * S.wob.hat * 0.12;
-    ctx.save(); ctx.translate(S.hat.x, S.hat.y - S.hat.drop * 120); ctx.rotate(wb2);
-    drawHat(0, 0, 1, 1);
-    ctx.restore();
+}
+// mini head with hair (wig stand / mirror reflection). origin screen (ox,oy), scale k, wig def or null for live strands
+function drawMini(ox,oy,k,wig,mirrored){
+  const u=U*k,m=mirrored?-1:1;
+  const P=(x,y)=>[ox+m*(x-4)*u,oy+(y-3.5)*u];
+  const b=(x,y,w,h,col,dep)=>{const p=P(x+w/2,y+h/2);box(p[0],p[1],w*u,h*u,0,dep===undefined?0.12*k*6:dep,col);};
+  b(0,0,8,7,wig?PAL.cream:PAL.skin);
+  if(!wig){b(1.6,2.8,0.8,0.8,PAL.eye,0);b(5.6,2.8,0.8,0.8,PAL.eye,0);}
+  b(-0.4,-1,8.8,1.6,tint(PAL.hair,0.85));
+  const lens=wig?null:G.strands;
+  const strands=lens||makeStrandsPreview(wig);
+  for(const s of strands){const L=(wig?s.max:s.len*s.gk);if(L<0.2)continue;
+    const A=s.a,dx=Math.sin(A)*m,dy=Math.cos(A);const p=P(s.ax,s.ay);
+    const col=s.g==='beard'?PAL.beard:(s.g==='mus'?tint(PAL.hair,0.85):PAL.hair);
+    box(p[0]+dx*L*u/2,p[1]+dy*L*u/2,s.wd*u*0.95,L*u,-A*m,0,col);}
+}
+const previewCache=new Map();
+function makeStrandsPreview(w){let v=previewCache.get(w);if(!v){v=makeStrands(w,1);previewCache.set(w,v);}return v;}
+function drawHook(){
+  wbox(-2.5,21.5,0.5,0.5,0,0.6,PAL.frame);
+  const ht=G.hat;
+  if(ht.state==='hook'||(ht.state==='fly'&&ht.t<0.35))drawHat(-2.5,20.1,0.32*ease(ht.pop),ht.wob*0.25);
+}
+function drawHat(X,Y,s,ang,tilt){ // X,Y = bottom centre of brim; s=1 → roof size
+  if(s<=0.01)return;
+  const bw=9.2*s,bh=Math.max(0.12,0.5*s),cw=5.6*s,ch=2.2*s,band=0.42*s;
+  const c=Math.cos(ang),sn=Math.sin(ang);
+  const at=(dx,dy)=>[X+dx*c+dy*sn,Y+dy*c-dx*sn];
+  let p=at(0,bh/2);wbox(p[0],p[1],bw,bh,ang,1.15*Math.max(0.35,s),PAL.ver);
+  p=at(0,bh+ch/2);wbox(p[0],p[1],cw,ch,ang,0.9*Math.max(0.35,s),PAL.ver);
+  p=at(0,bh+band/2);wbox(p[0],p[1],cw*1.01,band,ang,0.92*Math.max(0.35,s),PAL.cream);
+}
+function hb(x,y,w,h,dep,col,dz,mask){const p=H2S(x+w/2,y+h/2);box(p[0]-DX*(dz||0),p[1]-DY*(dz||0),w*U,h*U,hd.rot,dep,col,mask);}
+function bb(x,y,w,h,dep,col){box(sx(x+w/2),sy(HEADY-(y+h/2))+UN.body*U,w*U,h*U,0,dep,col);}
+function drawUncle(){
+  // chair (fixed)
+  box(sx(4),sy(HEADY-6.8),9.8*U,6.6*U,0,0.7,PAL.chair);
+  const jY=floorY+DY*2.4;
+  ctx.fillStyle=PAL.pole;const py0=sy(HEADY-13.6);ctx.fillRect(sx(3.35),py0,1.3*U,Math.max(0,jY-py0));
+  box(sx(4),jY-0.15*U,4.2*U,0.35*U,0,1.2,tint(PAL.pole,0.9));
+  // shadow on wall
+  const shOff=[0.32*U,0.22*U];ctx.fillStyle=PAL.wallShadow;
+  const hc=H2S(4,3.5);ctx.save();ctx.translate(hc[0]+shOff[0]+DX,hc[1]+shOff[1]+DY);ctx.rotate(hd.rot);ctx.fillRect(-4.4*U,-4.6*U,8.8*U,8.6*U);ctx.restore();
+  // cape
+  const sh=UN.shrug>0?Math.sin(UN.shrug*Math.PI)*0.5:0;
+  bb(-1.7,8.9,11.4,5.1,1.3,PAL.mint);
+  bb(-0.6,7.9-sh,9.2,1.4,1.3,PAL.mint);
+  bb(2.4,7.3-sh*0.5,3.2,0.7,1.3,PAL.cream);
+  // neck
+  hb(2.8,6.4,2.4,1.2,1.2,tint(PAL.skin,0.88));
+  // head
+  hb(0,0,8,7,1.6,PAL.skin);
+  hb(-0.45,3.0,0.5,1.5,0.6,tint(PAL.skin,0.9));hb(7.95,3.0,0.5,1.5,0.6,tint(PAL.skin,0.9));
+  drawFace();
+  // crown (wig cap)
+  const tuft=WIGS[G.wig].tuft;
+  hb(-0.5,-0.9,9,1.6,1.7,tint(PAL.hair,0.82));
+  for(let i=0;i<8;i++){const th=TUFT[i]*tuft;hb(i-0.4+0.05,-0.9-th,1.0,th+0.05,1.5,tint(PAL.hair,i%2?0.9:0.78),0,1|2);}
+  // hair groups
+  const order=['beard','side','bang','mus'];
+  for(const g of order)for(const s of G.strands)if(s.g===g)drawStrand(s);
+}
+function drawFace(){
+  const laugh=UN.laugh>0,proud=UN.proud>0,sur=UN.sur>0&&!laugh;
+  const blink=UN.blinkT>=0;
+  const gx=UN.gx*0.2,gy=clamp(UN.gy,-1,1)*0.15;
+  // cheeks
+  const ck=UN.sheep>0||laugh?PAL.ver:PAL.cheek;
+  hb(1.1,4.3,1.2,0.6,0.08,ck,0.02);hb(5.7,4.3,1.2,0.6,0.08,ck,0.02);
+  // eyes
+  for(let i=0;i<2;i++){const ex=i?6:2,ey=3.2;
+    if(laugh||proud||UN.sheep>0){hb(ex-0.45,ey-0.05,0.9,0.22,0.08,PAL.eye,0.02);hb(ex-0.55,ey+0.12,0.25,0.2,0.08,PAL.eye,0.02);hb(ex+0.3,ey+0.12,0.25,0.2,0.08,PAL.eye,0.02);}
+    else if(blink){hb(ex-0.45,ey+0.05,0.9,0.18,0.08,PAL.eye,0.02);}
+    else{const s=sur?0.95:0.75;hb(ex-s/2+gx,ey-s/2+gy,s,s,0.1,PAL.eye,0.02);hb(ex-s/2+gx+0.08,ey-s/2+gy+0.08,0.22,0.22,0,PAL.white,0.03);}
+  }
+  // brows
+  const by=2.15-(sur?0.4:0)-(UN.surBig?0.15:0);const asL=UN.asym>0?0.3:0,asR=UN.asym<0?0.3:0;
+  hb(1.3,by-asL,1.4,0.32,0.15,tint(PAL.hair,0.8),0.02);hb(5.3,by-asR,1.4,0.32,0.15,tint(PAL.hair,0.8),0.02);
+  // nose
+  hb(3.5,3.7,1.0,1.4,0.9,tint(PAL.skin,0.97),0.5);
+  // mouth
+  const m=PAL.mouth;
+  if(laugh){hb(3.1,5.55,1.8,0.85,0.06,m,0.02);hb(3.5,6.05,1.0,0.3,0.04,PAL.ver,0.03);}
+  else if(sur){hb(3.6,5.5,0.8,0.8,0.06,m,0.02);}
+  else if(UN.sheep>0){for(let i=0;i<4;i++)hb(3.1+i*0.45,5.75+(i%2?0.15:0),0.45,0.22,0.06,m,0.02);}
+  else{const smile=proud||UN.shrug>0||G.ev.cuts>8||G.phase!=='play';
+    if(smile){hb(3.4,6.0,1.2,0.28,0.06,m,0.02);hb(3.05,5.8,0.4,0.28,0.06,m,0.02);hb(4.55,5.8,0.4,0.28,0.06,m,0.02);}
+    else hb(3.4,5.85,1.2,0.26,0.06,m,0.02);}
+}
+function drawStrand(s){
+  const g=sGeom(s);if(g.L<0.5)return;
+  const ang=-g.A,n=Math.ceil(g.L/U-0.001);
+  const base=s.g==='beard'?PAL.beard:(s.g==='mus'?tint(PAL.hair,0.85):PAL.hair);
+  const c1=base,c2=tint(base,s.g==='beard'?0.94:0.9);
+  if(s===G.invite&&G.phase==='play'){const gl=s.glow;const cx=g.x+g.dx*g.L/2,cy=g.y+g.dy*g.L/2;
+    ctx.globalAlpha=gl;box(cx,cy,U*1.55,g.L+U*0.55,ang,0,'#fff6d6');ctx.globalAlpha=1;}
+  const dep=s.g==='mus'?0.7:0.95;
+  for(let i=n-1;i>=0;i--){const a0=i*U,a1=Math.min(g.L,(i+1)*U);const m=(a0+a1)/2;const wd=s.wd*U*(i===n-1&&n>1?0.82:1);
+    box(g.x+g.dx*m,g.y+g.dy*m,wd,a1-a0+0.6,ang,dep,i%2?c2:c1,i===0?15:14);}
+}
+function drawHouse(h,X0,cur){
+  const tl=h.tilt+h.wob*0.05,tn=Math.tan(tl);
+  // slab
+  wbox(X0+4,-0.2,8.7,0.4,0,1.7,PAL.slab,15,0.2);
+  // floor shadow
+  const ht=houseHeight(h);
+  if(ht>0){ctx.fillStyle='rgba(60,50,40,0.22)';const x1=sx(X0+8+tn*ht),y1=sy(0);
+    ctx.beginPath();ctx.moveTo(sx(X0+8),y1);ctx.lineTo(x1+ht*0.22*U,y1);ctx.lineTo(x1+ht*0.22*U+DX,y1+DY);ctx.lineTo(sx(X0+8)+DX,y1+DY);ctx.fill();}
+  for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){
+    const e=h.cells[r][c];
+    if(!e){if(h.win.has(r*COLS+c))drawWindow(X0+c+0.5+tn*(r+0.5),r+0.5,tl);continue;}
+    if(e.ghost)continue;
+    let ox=0,oy=0;const a=h.anim.get(e.id);
+    if(a){const k=ease(a.t/a.dur);ox=a.ox*(1-k);oy=a.oy*(1-k);if(a.t>a.dur){const b=(a.t-a.dur)/0.28;oy-=Math.sin(Math.min(1,b)*Math.PI)*0.16;}}
+    const up=r+1<ROWS?h.cells[r+1][c]:null,rt=c+1<COLS?h.cells[r][c+1]:null;
+    let mask=0;if(!up||up.ghost||(h.anim.has(up.id)&&up.id!==e.id))mask|=1;if(!rt||rt.ghost||(h.anim.has(rt.id)&&rt.id!==e.id))mask|=2;
+    const X=X0+c+0.5+tn*(r+0.5)+ox,Y=r+0.5-oy;
+    box(sx(X),sy(Y),U*1.002,U*1.002,tl,1,e.col,mask);
+    if(h.flash[c]>0){ctx.globalAlpha=h.flash[c]*0.6;box(sx(X),sy(Y),U,U,tl,0,PAL.white);ctx.globalAlpha=1;}
+  }
+  // door + eave
+  if(h.door||h.eave>0){const dX=X0+4+tn*1;wbox(dX,0.95,1.3,1.9,tl,0,PAL.door,15,-0.02);wbox(dX+0.4,0.95,0.18,0.18,0,0,PAL.cream,15,-0.03);}
+  if(h.eave>0){const ew=Math.min(5.4,1.6+h.eave*0.32);const eX=X0+4+tn*2.2;
+    wbox(eX-ew/2+0.15,1.05,0.22,2.1,0,0.22,PAL.frame,15,0.9);wbox(eX+ew/2-0.15,1.05,0.22,2.1,0,0.22,PAL.frame,15,0.9);
+    wbox(eX,2.3,ew,0.34,tl,1.05,tint(PAL.hair,0.85),15,1.0);}
+  // windows stay visible in front of the painted door
+  if(h.door||h.eave>0)for(const k of h.win){const r=Math.floor(k/COLS),c=k%COLS;if(r<3&&(c===3||c===4))drawWindow(X0+c+0.5+tn*(r+0.5),r+0.5,tl);}
+  // roof hat
+  if(h.roof)drawHat(X0+4+tn*h.height,h.height,1,tl);
+}
+function drawWindow(X,Y,tl){
+  wbox(X,Y,1,1,tl,0,PAL.mintD,15,-0.5);
+  wbox(X,Y,0.68,0.68,tl,0,PAL.mint,15,-0.48);
+  wbox(X-0.12,Y+0.12,0.16,0.3,tl,0,PAL.white,15,-0.47);
+  wbox(X,Y+0.43,1,0.16,tl,0.55,PAL.cream);wbox(X,Y-0.44,1.08,0.16,tl,0.65,PAL.cream);
+  wbox(X-0.43,Y,0.16,1,tl,0.55,PAL.cream);wbox(X+0.43,Y,0.16,1,tl,0.55,PAL.cream);
+}
+function drawPassage(h,X0){
+  const P=h.passage;if(!P)return;const xL=X0-GAP,xR=X0;
+  if(P.type==='bridge'){const n=P.n,sw=GAP/n,show=Math.floor(P.prog*n+0.001);
+    for(let i=0;i<show;i++){const y=lerp(P.hp,P.hc,(i+0.5)/n);wbox(xL+sw*(i+0.5),y-0.15,sw*0.96,0.3,0,1,i%2?PAL.frame:tint(PAL.frame,1.15));}
+    if(P.prog>=1){wbox(xL+0.15,P.hp+0.4,0.22,0.8,0,0.3,PAL.ver);wbox(xR-0.15,P.hc+0.4,0.22,0.8,0,0.3,PAL.ver);
+      ctx.strokeStyle=PAL.ver;ctx.lineWidth=Math.max(1,U*0.08);ctx.beginPath();ctx.moveTo(sx(xL+0.15),sy(P.hp+0.75));ctx.lineTo(sx(xR-0.15),sy(P.hc+0.75));ctx.stroke();}
+  } else {const n=P.n,sw=GAP/n,show=Math.floor(P.prog*n+0.001),d=P.hc-P.hp;
+    for(let i=0;i<show;i++){const top=P.hp+d*(i+1)/(n+1);wbox(xL+sw*(i+0.5),top/2,sw*1.002,top,0,1,i%2?PAL.beard:tint(PAL.hair,1.1),15);}
   }
 }
-function drawHat(cx, by, sx, sy) {
-  cube(cx - 32 * sx, by - 8 * sy, 64 * sx, 8 * sy, 18 * Math.min(sx, 2.2), P.ver);
-  cube(cx - 20 * sx, by - 38 * sy, 40 * sx, 30 * sy, 16 * Math.min(sx, 2.2), P.ver);
-  rect(cx - 20 * sx, by - 15 * sy, 40 * sx, 6 * sy, P.mint.f);
+function drawLedge(){
+  if(!G.town.length||G.phase!=='play')return;const hp=G.town[0].height;const h=G.house;
+  const gl=h.ledgeGlow>0?0.5+0.5*Math.sin(G.t*10):0;
+  wbox(-GAP+0.3,hp-0.18,0.6,0.36,0,0.9,gl>0.5?PAL.white:PAL.mint);
 }
-
-/* ---------- おじさん ---------- */
-function drawTuft(t, cx, top, glow, sc) {
-  const x = cx + t.x * V, root = top + t.root * V;
-  const len = t.disp;
-  if (len <= 0.02) return;
-  const w = (t.kind === 'mus' ? 1.0 : 0.94) * V * (1 + Math.max(0, t.sq) * 0.6);
-  const step = V * (1 - t.sq);
-  const n = Math.ceil(len - 0.001);
-  const hop = t.hop || 0;
-  const col = P[t.col];
-  if (glow) {
-    ctx.globalAlpha = 0.28 + 0.2 * Math.sin(S.t * 6);
-    rect(x - w / 2 - 6, root - 3 - hop, w + 12 + HDEP * 0.55, len * step + 9, '#ffffff');
-    ctx.globalAlpha = 1;
-  }
-  for (let i = n - 1; i >= 0; i--) {
-    const frac = Math.min(1, len - i);
-    const sway = Math.sin(S.t * 1.7 + t.ph + i * 0.7) * i * 0.45 + t.part * (i + 1) * 4.5;
-    const vy = root + i * step - hop;
-    cube(x - w / 2 + sway, vy, w, step * frac + 0.6, HDEP, col);
-  }
+function drawRubble(h,X0){
+  for(const r of h.rubble){box(sx(X0+r.X)-DX*r.z,sy(r.Y)-DY*r.z,U*0.8,U*0.8,r.ang,0.8,r.col);}
 }
-function drawHeadCore(cx, top, tufts, hairCol, mann, features) {
-  const skin = mann ? P.mann : P.skin;
-  // 顔
-  cube(cx - 3.5 * V, top, 7 * V, 7.7 * V, 26, skin);
-  // 耳
-  if (!mann) { cube(cx - 3.9 * V, top + 3.2 * V, 0.5 * V, 1.4 * V, 8, skin); cube(cx + 3.4 * V, top + 3.2 * V, 0.5 * V, 1.4 * V, 8, skin); }
-  for (const t of tufts) if (t.kind === 'side') drawTuft(t, cx, top, false);
-  // 髪のかたまり(帽子のように頭に乗る)
-  cube(cx - 4.5 * V, top - 1.2 * V, 9 * V, 2.3 * V, 30, P[hairCol]);
-  if (features) drawFace(cx, top);
-  else if (mann) { rect(cx - 0.4 * V, top + 4 * V, 0.8 * V, 1 * V, P.mann.s); }
-  for (const t of tufts) if (t.kind === 'beard') drawTuft(t, cx, top, false);
-  for (const t of tufts) if (t.kind === 'mus') drawTuft(t, cx, top, false);
-  for (const t of tufts) if (t.kind === 'bang') drawTuft(t, cx, top, false);
+function drawPieces(){
+  const h=G.house;
+  for(const p of G.pieces){
+    if(p.type!=='eave'){let rest=0;for(let c=p.cmin;c<=p.cmin+p.tw-1;c++)rest=Math.max(rest,topOf(h,c));
+      const k=clamp(1-(p.dist||0)/14,0.15,0.6);ctx.fillStyle='rgba(40,40,50,'+(k*0.45).toFixed(3)+')';
+      const x0=sx(p.cmin+Math.tan(h.tilt)*rest),y0=sy(rest);ctx.beginPath();ctx.moveTo(x0,y0);ctx.lineTo(x0+p.tw*U,y0);ctx.lineTo(x0+p.tw*U+DX,y0+DY);ctx.lineTo(x0+DX,y0+DY);ctx.fill();}
+    const q=p.type==='small'?Math.PI/2:Math.PI;let res=p.ang-Math.round(p.ang/q)*q;
+    const f=clamp((p.dist||0)/3,0,1);const ang=res*f+(p.ang-res)*0;
+    // early: show as the original strand piece rotating into a block
+    const age=G.t-p.t0;const a2=age<0.15?lerp(p.ang,ang,age/0.15):ang;
+    box(sx(p.X),sy(p.Y),p.w*U,p.h*U,a2,p.type==='eave'?0.8:1,p.col);
+  }
+  for(const R of G.rolling){const hop=Math.sin(R.hop*Math.PI)*0.35;const tw=Math.sin(R.hop*Math.PI)*0.35*R.dir;
+    box(sx(R.X+Math.tan(h.tilt)*R.Y),sy(R.Y+hop),R.w*U,R.hh*U,tw,1,R.col);}
 }
-function drawFace(cx, top) {
-  const u = S.uncle;
-  const e = u.expr;
-  const turn = u.mirror * 5;
-  const fx = cx + turn;
-  // 眉
-  const by = top + 2.25 * V - (e === 'surprise' || e === 'wow' ? 4 : 0);
-  for (let i = 0; i < 2; i++) {
-    const ex = fx + (i ? 1.5 : -1.5) * V;
-    if (e === 'worried') {
-      rect(ex - 0.45 * V, by + (i ? -2 : 2), 0.45 * V, 0.22 * V, P.brown.s);
-      rect(ex, by + (i ? 2 : -2), 0.45 * V, 0.22 * V, P.brown.s);
-    } else rect(ex - 0.45 * V, by, 0.9 * V, 0.24 * V, P.brown.s);
-  }
-  // 目
-  const ang = Math.atan2(u.ly - (top + 3.4 * V), u.lx - fx);
-  const px = Math.cos(ang) * 2.6, py = Math.sin(ang) * 2.2;
-  for (let i = 0; i < 2; i++) {
-    const ex = fx + (i ? 1.5 : -1.5) * V, ey = top + 3.4 * V;
-    let closed = u.blink > 0;
-    if (u.burst[i] > 0 && Math.sin(u.burst[i] * 26) > 0.2) closed = true;
-    const happy = e === 'happy' || e === 'giggle' || e === 'proud' || e === 'shrug';
-    if (happy) {
-      rect(ex - 0.42 * V, ey, 0.25 * V, 0.2 * V, DARK);
-      rect(ex - 0.2 * V, ey - 0.25 * V, 0.4 * V, 0.2 * V, DARK);
-      rect(ex + 0.18 * V, ey, 0.25 * V, 0.2 * V, DARK);
-    } else if (closed) {
-      rect(ex - 0.4 * V, ey, 0.8 * V, 0.16 * V, DARK);
-    } else {
-      const big = (e === 'surprise' || e === 'wow' || e === 'oops') ? 1.22 : e === 'shy' ? 0.85 : 1;
-      const w = 0.62 * V * big, h = 0.8 * V * big;
-      rect(ex - w / 2 + px, ey - h / 2 + py, w, h, DARK);
-      rect(ex - w / 2 + px + 2, ey - h / 2 + py + 2, w * 0.36, h * 0.3, '#ffffff');
-    }
-  }
-  // ほっぺ
-  const bl = Math.max(u.blush, e === 'giggle' || e === 'shy' ? 1 : 0);
-  if (bl > 0) {
-    ctx.globalAlpha = Math.min(1, bl) * 0.5;
-    rect(fx - 2.8 * V, top + 4.5 * V, 1.1 * V, 0.55 * V, P.ver.f);
-    rect(fx + 1.7 * V, top + 4.5 * V, 1.1 * V, 0.55 * V, P.ver.f);
-    ctx.globalAlpha = 1;
-  }
-  // 鼻
-  cube(fx - 0.55 * V, top + 3.9 * V, 1.1 * V, 1.2 * V, 12, P.skin);
-  // 口
-  const my = top + 6.0 * V;
-  if (e === 'giggle') {
-    const o = Math.abs(Math.sin(S.t * 22));
-    rect(fx - 1.1 * V, my - 0.1 * V, 2.2 * V, (0.45 + o * 0.35) * V, DARK);
-    rect(fx - 0.6 * V, my + 0.25 * V + o * 0.3 * V, 1.2 * V, 0.2 * V, P.ver.f);
-  } else if (e === 'surprise' || e === 'wow' || e === 'oops') {
-    rect(fx - 0.35 * V, my, 0.7 * V, 0.7 * V, DARK);
-  } else if (e === 'happy' || e === 'proud' || e === 'shrug') {
-    rect(fx - 1.0 * V, my, 2.0 * V, 0.5 * V, DARK);
-    rect(fx - 0.5 * V, my + 0.3 * V, 1.0 * V, 0.2 * V, P.ver.f);
-  } else if (e === 'worried') {
-    rect(fx - 0.8 * V, my + 0.2 * V, 0.5 * V, 0.2 * V, DARK); rect(fx - 0.3 * V, my, 0.6 * V, 0.2 * V, DARK); rect(fx + 0.3 * V, my + 0.2 * V, 0.5 * V, 0.2 * V, DARK);
-  } else if (e === 'shy') {
-    rect(fx - 0.6 * V, my + 0.1 * V, 1.2 * V, 0.22 * V, DARK);
-  } else {
-    rect(fx - 0.7 * V, my + 0.1 * V, 1.4 * V, 0.25 * V, DARK);
+function drawParts(){for(const p of G.parts){ctx.globalAlpha=clamp(p.life/p.max*1.5,0,1);box(sx(p.X),sy(p.Y),p.s*U,p.s*U,p.ang,0.3,p.col);}ctx.globalAlpha=1;}
+function drawTrail(){
+  if(G.trail.length<2)return;ctx.lineCap='round';ctx.lineJoin='round';
+  for(let i=1;i<G.trail.length;i++){const a=G.trail[i-1],b=G.trail[i];if(b.s!==a.s)continue;const age=G.t-b.t;
+    ctx.strokeStyle='rgba(255,255,255,'+clamp(1-age/0.28,0,1).toFixed(3)+')';ctx.lineWidth=U*0.22*clamp(1-age/0.28,0.2,1);
+    ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();}
+}
+function drawWigs(){
+  if(!G.wigs.length&&!G.shift)return;
+  const e=G.shift?clamp(G.shift.t/0.45,0,1):0;
+  if(G.wigs.length){const shelfA=G.shift?1-e:1;
+    if(shelfA>0.02){ctx.globalAlpha=shelfA;wbox(4,12.6,9.6,0.4,0,1.2,PAL.frame);ctx.globalAlpha=1;}}
+  for(const w of G.wigs){
+    const app=ease(w.t/0.35);if(app<=0)continue;
+    let X=w.X,Y=w.Y,k=0.3*app;
+    if(G.shift){if(w.i===G.shift.i){X=lerp(w.X,4,ease(e));Y=lerp(w.Y,HEADY-2,ease(e));k=lerp(0.3,1,ease(e));if(e>=1)continue;}
+      else{Y=w.Y-ease(e)*3;k=0.3*(1-e);if(k<0.02)continue;}}
+    if(!G.shift){wbox(X,13.1,0.3,0.6,0,0.5,PAL.pole);}
+    const hl=(!G.shift&&w.i===G.wigHL);
+    if(hl){ctx.globalAlpha=0.45+0.25*Math.sin(G.t*5);box(sx(X),sy(Y),U*3.3,U*4.6+WIGS[w.i].beard*U*0.3,0,0,'#fff6d6');ctx.globalAlpha=1;}
+    ctx.save();ctx.translate(sx(X),sy(Y));ctx.scale(1,w.sq);drawMini(0,-0.2*U*k/0.3,k,WIGS[w.i],false);ctx.restore();
   }
 }
-function drawUncle() {
-  const u = S.uncle;
-  const cx = u.x, top = headTop();
-  const sh = u.shrug * 10;
-  // 椅子
-  shadow(cx - 100, L.horizon + 22, 200, 22);
-  cube(cx - 100, L.horizon - 12, 200, 34, 40, P.chair);
-  cube(cx - 14, L.horizon - 30, 28, 20, 16, P.slab);
-  // ケープ(ミント)
-  cube(cx - 5.9 * V, top + 8.4 * V - sh, 11.8 * V, 6.6 * V + sh, 44, P.mint);
-  cube(cx - 6.9 * V, top + 9.2 * V - sh * 1.3, 2.2 * V, 1.6 * V, 30, P.mint);
-  cube(cx + 4.7 * V, top + 9.2 * V - sh * 1.3, 2.2 * V, 1.6 * V, 30, P.mint);
-  // 首
-  cube(cx - 1.2 * V, top + 7.4 * V, 2.4 * V, 1.2 * V, 16, P.skin);
-  // 頭(かしげ・おじぎ)
-  const wf = Math.sin(S.t * 30) * S.wob.face * 0.03;
-  const bob = -Math.abs(Math.sin(S.t * 14)) * u.bounce * 5 + u.bow * 16;
-  ctx.save();
-  ctx.translate(cx, top + 8 * V);
-  ctx.rotate((u.tilt * Math.PI) / 180 + wf);
-  ctx.translate(-cx, -(top + 8 * V) + bob);
-  // 前髪・ひげは誘導対象を光らせる
-  const tg = S.target && S.target.type === 'tuft' && S.mode === 'build' ? S.target.t : null;
-  cube(cx - 3.5 * V, top, 7 * V, 7.7 * V, 26, P.skin);
-  cube(cx - 3.9 * V, top + 3.2 * V, 0.5 * V, 1.4 * V, 8, P.skin);
-  cube(cx + 3.4 * V, top + 3.2 * V, 0.5 * V, 1.4 * V, 8, P.skin);
-  for (const t of S.tufts) if (t.kind === 'side') drawTuft(t, cx, top, t === tg);
-  cube(cx - 4.5 * V, top - 1.2 * V, 9 * V, 2.3 * V, 30, P[u.hairCol]);
-  drawFace(cx, top);
-  for (const t of S.tufts) if (t.kind === 'beard') drawTuft(t, cx, top, t === tg);
-  for (const t of S.tufts) if (t.kind === 'mus') drawTuft(t, cx, top, t === tg);
-  for (const t of S.tufts) if (t.kind === 'bang') drawTuft(t, cx, top, t === tg);
-  ctx.restore();
-  // 手
-  for (let i = 0; i < 2; i++) drawHand(S.hands[i].x, S.hands[i].y, P.hand, i ? 1 : -1);
+function drawHand(x,y,press){
+  const s=U*(1-press*0.12);
+  box(x+0.2*s,y+0.75*s,0.95*s,0.95*s,0,0.8,PAL.skin);
+  box(x,y+0.1*s,0.32*s,0.75*s,0,0.6,PAL.skin);
+  box(x+0.65*s,y+0.45*s,0.3*s,0.4*s,0,0.6,tint(PAL.skin,0.95));
 }
-function drawHand(x, y, c, side) {
-  cube(x - 15, y - 12, 30, 24, 12, c);
-  cube(x + (side > 0 ? -21 : 13), y - 6, 8, 12, 8, c);
+function drawDemo(){
+  const D=G.demo;if(!D)return;const t=D.t;const a=t<0.2?t/0.2:t>1.3?Math.max(0,1-(t-1.3)/0.3):1;
+  ctx.globalAlpha=a;
+  if(D.kind==='swipe'){const k=ease(clamp((t-0.25)/0.8,0,1));const x=lerp(D.x0,D.x1,k),y=lerp(D.y0,D.y1,k);
+    if(k>0&&k<1){ctx.strokeStyle='rgba(255,255,255,0.7)';ctx.lineWidth=U*0.18;ctx.lineCap='round';ctx.beginPath();ctx.moveTo(lerp(D.x0,D.x1,Math.max(0,k-0.35)),lerp(D.y0,D.y1,Math.max(0,k-0.35)));ctx.lineTo(x,y);ctx.stroke();}
+    drawHand(x,y,k>0&&k<1?1:0);}
+  else{const px=sx(D.X),py=sy(D.Y);const pr=(t>0.5&&t<0.8)?1:0;drawHand(px,py-(pr?0:0.4*U),pr);}
+  ctx.globalAlpha=1;
 }
-function drawDemoHand(x, y, press) {
-  const s = 1.7 * (1 - press * 0.12);
-  // 指さし(白い手袋)。指先が切る位置
-  rect(x - 7 * s + 3, y + 3, 15 * s, 24 * s, 'rgba(30,38,52,0.35)');
-  rect(x - 15 * s + 3, y + 19 * s + 3, 34 * s, 30 * s, 'rgba(30,38,52,0.35)');
-  cube(x - 5 * s, y, 10 * s, 22 * s, 8, P.ghost);
-  cube(x - 15 * s, y + 18 * s, 32 * s, 28 * s, 12, P.ghost);
-  rect(x - 15 * s, y + 34 * s, 32 * s, 3, P.ghost.s);
-}
-
-/* ---------- 家の描画 ---------- */
-function drawHouse(h, cur) {
-  const x0 = X0(h), base = L.base;
-  const wob = Math.sin(S.t * 32) * h.wob * 1.5;
-  ctx.save(); ctx.translate(wob, 0);
-  const tm = restMax(h);
-  shadow(x0 + COLS * CELL + 6, base + 8, 14, Math.min(26, 8 + tm * 3));
-  // 土台
-  cube(x0 - 8, base, COLS * CELL + 16, 12, DEP + 8, P.slab);
-  if (h.glow > 0) { ctx.globalAlpha = h.glow * 0.5; rect(x0 - 8, base, COLS * CELL + 16, 12, '#ffffff'); ctx.globalAlpha = 1; }
-  // 開いた隙間(家の中の暗がり)
-  const groups = [[], [], []];
-  for (const b of h.blocks) groups[blockSide(b) + 1].push(b);
-  for (let gi = 0; gi < 3; gi++) {
-    ctx.save();
-    applyTilt(h, gi - 1, x0, base);
-    for (let c = 0; c < COLS; c++) {
-      const side = c < 3 ? -1 : c > 3 ? 1 : 0;
-      if (side !== gi - 1) continue;
-      const top = colHeight(h, c);
-      for (let r = 0; r < top; r++) {
-        if (h.g[c][r] === 0) {
-          const win = h.windows.has(c) && (r === 1 || r === 2);
-          rect(x0 + c * CELL, base - (r + 1) * CELL, CELL, CELL, win ? '#9fd0e0' : GAPC);
-        }
-      }
-    }
-    // 窓
-    for (const c of h.windows) {
-      const side = c < 3 ? -1 : 1;
-      if (side !== gi - 1) continue;
-      const wx = x0 + c * CELL, wy = base - 3 * CELL;
-      rect(wx, wy, CELL, 2 * CELL, '#9fd0e0');
-      rect(wx + 4, wy + 6, 8, 18, '#d8eef4');
-    }
-    const bl = groups[gi].slice().sort((a, b) => a.r - b.r || a.c - b.c);
-    for (const b of bl) drawBlock(x0, base, b);
-    for (const c of h.windows) {
-      const side = c < 3 ? -1 : 1;
-      if (side !== gi - 1) continue;
-      const wx = x0 + c * CELL, wy = base - 3 * CELL;
-      cube(wx - 2, wy - 2, CELL + 4, 5, 6, P.mint);
-      cube(wx - 2, wy + 2 * CELL - 3, CELL + 4, 5, 6, P.mint);
-      rect(wx - 2, wy, 4, 2 * CELL, P.mint.f);
-      rect(wx + CELL - 2, wy, 4, 2 * CELL, P.mint.f);
-      rect(wx + CELL / 2 - 2, wy, 4, 2 * CELL, P.mint.f);
-      rect(wx, wy + CELL - 2, CELL, 4, P.mint.f);
-    }
-    ctx.restore();
-  }
-  // 玄関
-  const dx = x0 + DOORC * CELL, dw = Math.sin(S.t * 40) * h.doorWob * 2;
-  rect(dx + 2 + dw, base - 2 * CELL + 4, CELL - 4, 2 * CELL - 4, '#2e3644');
-  rect(dx + 5 + dw, base - 2 * CELL + 8, CELL - 10, 2 * CELL - 8, P.door.f);
-  rect(dx + CELL - 11 + dw, base - CELL, 4, 4, P.cream.f);
-  cube(dx - 1 + dw, base - 2 * CELL, CELL + 2, 5, 8, P.mint);
-  // ひさし(口ひげ)
-  if (h.eave > 0) {
-    const ew = CELL * (0.7 + 0.32 * h.eave);
-    cube(x0 + (DOORC + 0.5) * CELL - ew / 2, base - 2 * CELL - 7, ew, 7, DEP + 18, P.brown);
-  }
-  // 屋根(帽子)
-  if (h.roof) {
-    const sxx = (COLS * CELL + 24) / 64, p = h.roof.pop;
-    drawHat(h.cx, h.roof.y - p * 10, sxx * (1 + p * 0.08), 1.1 * (1 - p * 0.2));
-  }
-  ctx.restore();
-  // 床に残った角材
-  for (const r of h.rubble) {
-    const rx = h.cx + r.rx, w = r.w * CELL * r.s, hh = r.h * CELL * r.s;
-    if (r.rest) shadow(rx + w / 2, r.y, 6, 8);
-    ctx.save(); ctx.translate(rx, r.y - hh / 2); ctx.rotate(r.rot);
-    cube(-w / 2, -hh / 2, w, hh, DEP * r.s, P[r.col]);
-    ctx.restore();
-  }
-}
-function applyTilt(h, side, x0, base) {
-  if (side < 0 && Math.abs(h.tiltL) > 0.05) {
-    const wob = h.tiltLT ? Math.sin(S.t * 3) * 0.6 : 0;
-    ctx.translate(x0, base); ctx.rotate((h.tiltL + wob) * Math.PI / 180); ctx.translate(-x0, -base);
-  } else if (side > 0 && Math.abs(h.tiltR) > 0.05) {
-    const x1 = x0 + COLS * CELL, wob = h.tiltRT ? Math.sin(S.t * 3) * 0.6 : 0;
-    ctx.translate(x1, base); ctx.rotate((h.tiltR + wob) * Math.PI / 180); ctx.translate(-x1, -base);
-  }
-}
-function drawBlock(x0, base, b) {
-  const w = b.w * CELL, hh = b.h * CELL;
-  const x = x0 + b.c * CELL, y = base - (b.ry + b.h) * CELL;
-  const sq = b.land * 0.12, pp = b.pop * 0.14;
-  const sw = w * (1 + sq + pp), shh = hh * (1 - sq + pp);
-  cube(x + (w - sw) / 2 + 0.5, y + (hh - shh) - (b.pop * 4) + 0.5, sw - 1, shh - 1, DEP, P[b.col]);
-}
-function drawConnector(prev, h, H1, H2, prog, ghost) {
-  const xa = X0(prev) + COLS * CELL + 4, xb = X0(h);
-  const base = L.base, ya = base - H1 * CELL, yb = base - H2 * CELL;
-  const type = Math.abs(H1 - H2) <= 1 ? 'bridge' : 'stairs';
-  ctx.globalAlpha = ghost ? 0.3 : 1;
-  if (type === 'bridge') {
-    const len = (xb - xa) * prog;
-    const ye = lerp(ya, yb, prog);
-    ctx.fillStyle = P.mint.t;
-    ctx.beginPath(); ctx.moveTo(xa, ya); ctx.lineTo(xa + 8, ya - 8); ctx.lineTo(xa + len + 8, ye - 8); ctx.lineTo(xa + len, ye); ctx.closePath(); ctx.fill();
-    ctx.fillStyle = P.mint.f;
-    ctx.beginPath(); ctx.moveTo(xa, ya); ctx.lineTo(xa + len, ye); ctx.lineTo(xa + len, ye + 9); ctx.lineTo(xa, ya + 9); ctx.closePath(); ctx.fill();
-    if (!ghost) {
-      for (let k = 0; k <= 4; k++) {
-        const f = k / 4; if (f > prog) break;
-        const px = lerp(xa, xb, f), py = lerp(ya, yb, f);
-        cube(px - 2, py - 18, 4, 18, 4, P.ver);
-      }
-      if (prog > 0.95) { cube(xa, ya - 20, xb - xa, 3, 4, P.ver); }
-    }
-  } else {
-    const n = Math.abs(H1 - H2), up = H2 > H1;
-    const sw = (xb - xa) / n;
-    const shown = Math.ceil(n * prog - 0.001);
-    for (let i = 0; i < shown; i++) {
-      const hgt = up ? H1 + i + 1 : H1 - i - 1;
-      const y = base - hgt * CELL;
-      const x = xa + i * sw;
-      cube(x, y, sw - 1, 9, 12, P.cream);
-      rect(x + sw / 2 - 2, y + 9, 4, base - y - 9, P.cream.s);
-    }
-  }
-  ctx.globalAlpha = 1;
-}
-function drawGuide(prev, h) {
-  // 前の家の高さ = つなぎ目。新しい土台の左の壁にその高さを薄く示す
-  const H1 = prev.rightH;
-  const x0 = X0(h), y = L.base - H1 * CELL;
-  ctx.globalAlpha = 0.28 + 0.12 * Math.sin(S.t * 3);
-  rect(x0, y - 3, 3 * CELL, 4, '#ffffff');
-  ctx.globalAlpha = 1;
-  const pr = X0(prev) + COLS * CELL;
-  cube(pr - 4, y - 6, 10, 6, 6, P.mint);
-}
-
-/* ---------- 本描画 ---------- */
-function render() {
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.fillStyle = BG; ctx.fillRect(0, 0, cv.width, cv.height);
-  ctx.setTransform(DPR * K, 0, 0, DPR * K, DPR * L.ox, DPR * L.oy);
-  drawRoom();
-  // かつらの棚
-  if (S.shelf > 0.01) {
-    for (let i = 0; i < 3; i++) {
-      if (S.wigFly && S.wigFly.i === i) continue;
-      const p = wigPos(i);
-      const glow = S.mode === 'choose' && S.target && S.target.type === 'wig' && S.target.i === i;
-      const hop = glow ? Math.max(0, Math.sin((S.t % 1.5) / 0.36 * Math.PI)) * ((S.t % 1.5) < 0.36 ? 6 : 0) : 0;
-      const wb = Math.sin(S.t * 30) * S.wob.shelf[i] * 0.1;
-      ctx.save(); ctx.translate(p.x, p.y - hop); ctx.rotate(wb);
-      if (glow) { ctx.globalAlpha = 0.25 + 0.15 * Math.sin(S.t * 6); rect(-40, -6, 80, 96, '#ffffff'); ctx.globalAlpha = 1; }
-      cube(-22, 78, 44, 8, 10, P.mint);
-      ctx.scale(0.27, 0.27);
-      drawHeadCore(0, 1.2 * V + 4, WIG_TUFTS[i], WIGS[i].hair, true, false);
-      ctx.restore();
-    }
-  }
-  // 家とつなぎ
-  const n = S.houses.length;
-  for (let i = 0; i < n; i++) {
-    const h = S.houses[i];
-    if (h.cx + SPACING < -LW / 2 - 40 || h.cx - SPACING > LW / 2 + 40) continue;
-    const prev = i > 0 ? S.houses[i - 1] : null;
-    if (prev && h.conn) drawConnector(prev, h, h.conn.H1, h.conn.H2, h.conn.prog, false);
-    else if (prev && h === S.cur && !h.done && S.mode === 'build') {
-      drawConnector(prev, h, prev.rightH, wallH(h, -1), 1, true);
-    }
-    drawHouse(h, h === S.cur);
-    if (prev && h === S.cur && !h.done && S.mode === 'build') drawGuide(prev, h);
-  }
+function render(){
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  drawBG();
+  drawMirror();drawHook();
   drawUncle();
-  // 運ばれる帽子
-  if (S.hat.state === 'carry' || S.hat.state === 'fly') {
-    const f = S.hat.state === 'fly' && S.hat.fly ? S.hat.fly.t : 0;
-    const sxx = lerp(1, (COLS * CELL + 24) / 64, f), syy = lerp(1, 1.1, f);
-    drawHat(S.hat.x, S.hat.y, sxx, syy);
-  }
-  // かつら
-  if (S.wigFly) {
-    const f = S.wigFly, k = f.t;
-    const x = lerp(f.x0, f.x1, k), y = lerp(f.y0, f.y1, k) - Math.sin(k * Math.PI) * 40, s = lerp(0.27, 1, k);
-    ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
-    drawHeadCore(0, 1.2 * V, WIG_TUFTS[f.i], WIGS[f.i].hair, true, false);
-    ctx.restore();
-  }
-  // 落ちる角材
-  for (const p of S.pieces) {
-    if (p.type === 'eave') {
-      const ew = CELL * (0.7 + 0.32 * p.elen) * p.s;
-      cube(p.x - ew / 2, p.y - 7, ew, 7, DEP * p.s, P[p.col]);
-      continue;
-    }
-    const w = p.w * CELL * p.s, hh = p.h * CELL * p.s;
-    ctx.save(); ctx.translate(p.x, p.y - hh / 2); ctx.rotate(p.rot);
-    cube(-w / 2, -hh / 2, w, hh, DEP * p.s, P[p.col]);
-    ctx.restore();
-  }
-  // 粒子
-  for (const q of S.parts) {
-    ctx.globalAlpha = clamp(q.life / q.max, 0, 1);
-    ctx.fillStyle = q.col;
-    ctx.save(); ctx.translate(q.x, q.y); ctx.rotate(q.rot); ctx.fillRect(-q.sz / 2, -q.sz / 2, q.sz, q.sz); ctx.restore();
-  }
-  ctx.globalAlpha = 1;
-  // 切断線
-  if (S.trail.length > 1) {
-    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    for (let i = 1; i < S.trail.length; i++) {
-      const a = S.trail[i - 1], b = S.trail[i];
-      const al = clamp(1 - (S.t - b.t) / 0.22, 0, 1);
-      ctx.strokeStyle = 'rgba(255,255,255,' + (0.9 * al).toFixed(3) + ')';
-      ctx.lineWidth = 6 * al + 1;
-      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
-    }
-  }
-  for (const r of S.rings) {
-    const k = r.t / 0.35;
-    ctx.strokeStyle = 'rgba(255,255,255,' + (0.5 * (1 - k)).toFixed(3) + ')'; ctx.lineWidth = 3;
-    ctx.beginPath(); ctx.arc(r.x, r.y, 8 + k * 16, 0, Math.PI * 2); ctx.stroke();
-  }
-  // お手本の手
-  if (S.demo) {
-    const d = S.demo, k = d.t / d.dur;
-    const fade = Math.min(1, d.t / 0.2, (d.dur - d.t) / 0.2);
-    ctx.globalAlpha = clamp(fade, 0, 1);
-    if (d.type === 'swipe') {
-      const m = clamp((k - 0.2) / 0.6, 0, 1);
-      const e = m * m * (3 - 2 * m);
-      const x = lerp(d.x0, d.x1, e);
-      if (m > 0) {
-        ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 5; ctx.lineCap = 'round';
-        ctx.beginPath(); ctx.moveTo(lerp(d.x0, d.x1, Math.max(0, e - 0.35)), d.y); ctx.lineTo(x, d.y); ctx.stroke();
-      }
-      drawDemoHand(x, d.y, 0);
-    } else {
-      const press = Math.max(0, Math.sin(k * Math.PI * 3));
-      drawDemoHand(d.x0, d.y + press * 4, press);
-    }
-    ctx.globalAlpha = 1;
-  }
+  // town (previous houses) + current
+  const se=shiftE(),step=8+GAP;
+  for(let k=G.town.length-1;k>=0;k--){const X0=-step*(k+1+se);if(sx(X0+10)<-U*2)continue;drawHouse(G.town[k],X0,false);
+    if(k+1<=G.town.length)drawPassage(G.town[k],X0);}
+  drawLedge();
+  drawHouse(G.house,-step*se,true);drawPassage(G.house,-step*se);
+  if(G.shift&&se>0)wbox(step*(1-se)+4,-0.2,8.7,0.4,0,1.7,PAL.slab,15,0.2);
+  drawRubble(G.house,-step*se);
+  if(G.hat.state==='fly'&&G.hat.t>=0.35&&G.hat.X!==undefined)drawHat(G.hat.X,G.hat.Y,G.hat.s,G.hat.ang);
+  if(UN.hand){const h=UN.hand;wbox(h.X,h.Y,1.15,1.05,0,0.9,PAL.skin,15,0.4);wbox(h.X-0.35,h.Y+0.72,0.38,0.6,0,0.7,PAL.skin,15,0.4);}
+  drawWigs();
+  drawPieces();drawParts();drawTrail();drawDemo();
 }
 
-/* ---------- ループ ---------- */
-let last = 0, running = true, raf = 0;
-function loop(now) {
-  if (!running) return;
-  let dt = (now - last) / 1000;
-  last = now;
-  if (!(dt > 0)) dt = 0;
-  dt = Math.min(dt, 1 / 30);   // 復帰時の時間の飛躍を防ぐ
-  update(dt);
-  render();
-  raf = requestAnimationFrame(loop);
+// ---------- input ----------
+function nearestStrand(x,y,rad){let best=null,bd=rad*U;
+  for(const s of G.strands){if(s.gk<0.5)continue;const g=sGeom(s);const rx=x-g.x,ry=y-g.y;let al=rx*g.dx+ry*g.dy;al=clamp(al,0,g.L);
+    const d=Math.hypot(x-(g.x+g.dx*al),y-(g.y+g.dy*al));if(d<bd){bd=d;best=s;}}return best;}
+function tapAt(x,y){
+  const X=wx(x),Y=wy(y);
+  if(G.phase==='choose'){for(const w of G.wigs){if(Math.abs(X-w.X)<1.65&&Y>w.Y-2.6&&Y<w.Y+1.8){chooseWig(w.i);return;}}}
+  const s=nearestStrand(x,y,0.85);
+  if(s&&G.phase==='play'){
+    for(const o of G.strands)if(o.g===s.g){const g1=sGeom(o),g2=sGeom(s);const d=Math.hypot(g1.x-g2.x,g1.y-g2.y)/U;const f=Math.max(0,1-d/3.5);
+      if(f>0){o.sq=Math.min(o.sq,1-0.22*f);o.sv=-0.5*f;o.wv+=rnd(-1,1)*f;}}
+    SND.squish();if(G.firstTap<0)G.firstTap=G.t;
+    const g=sGeom(s);for(let k=0;k<3;k++)addPart(X,Y,rnd(-1.5,1.5),rnd(1,3),s.g==='beard'?PAL.beard:PAL.hair,0.14,0.5,0.6);void g;
+    if(s.g==='bang')UN.blinkQ=Math.max(UN.blinkQ,1);
+    return;}
+  // unrelated objects: just a small wiggle
+  if(Math.abs(X-10.25)<1.1&&Math.abs(Y-18.4)<1.7){G.mirror.wv+=1.2;SND.tick();return;}
+  if(Math.abs(X+2.5)<1.6&&Y>19.6&&Y<22){G.hat.wv+=1.5;SND.tick();return;}
+  const hc=H2S(4,3.5);if(Math.abs(x-hc[0])<4*U&&Math.abs(y-hc[1])<3.8*U){UN.fv-=1.5;UN.blinkQ=1;SND.tick();return;}
+  const ht=houseHeight(G.house);if(X>-0.4&&X<8.4&&Y>-0.5&&Y<ht+0.5&&ht>0){G.house.wv+=1.2;SND.tick();return;}
 }
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) {
-    running = false; cancelAnimationFrame(raf);
-    endStroke();
-    try { if (AC && AC.state === 'running') AC.suspend(); } catch (e) {}
-  } else {
-    endStroke();
-    if (!running) { running = true; last = performance.now(); raf = requestAnimationFrame(loop); }
-    try { if (AC && AC.state === 'suspended') { const p = AC.resume(); if (p && p.catch) p.catch(() => {}); } } catch (e) {}
-  }
+function evPos(e){const r=cv.getBoundingClientRect();return [e.clientX-r.left,e.clientY-r.top];}
+function onDown(e){
+  e.preventDefault();audioInit();
+  if(activePointer!==null)return; // extra fingers are ignored
+  activePointer=e.pointerId;try{cv.setPointerCapture(e.pointerId);}catch(_){}
+  const [x,y]=evPos(e);G.strokeN++;
+  stroke={id:G.strokeN,x0:x,y0:y,lx:x,ly:y,moved:false,dir:1};
+  G.lastInput=G.t;G.demo=null;G.demoDone=false;UN.partDone=false;
+  tapAt(x,y);
+}
+function onMove(e){
+  if(e.pointerId!==activePointer||!stroke)return;e.preventDefault();
+  const evs=(e.getCoalescedEvents&&e.getCoalescedEvents().length)?e.getCoalescedEvents():[e];
+  for(const ev of evs){const [x,y]=evPos(ev);
+    if(!stroke.moved&&Math.hypot(x-stroke.x0,y-stroke.y0)>0.32*U){stroke.moved=true;}
+    if(stroke.moved){cutSeg(stroke.lx,stroke.ly,x,y);G.trail.push({x,y,t:G.t,s:stroke.id});if(G.trail.length>40)G.trail.shift();}
+    stroke.lx=x;stroke.ly=y;}
+  G.lastInput=G.t;
+}
+function endStroke(e){if(e&&e.pointerId!==activePointer)return;
+  if(e){try{cv.releasePointerCapture(e.pointerId);}catch(_){}}
+  activePointer=null;stroke=null;G.lastInput=G.t;}
+cv.addEventListener('pointerdown',onDown,{passive:false});
+cv.addEventListener('pointermove',onMove,{passive:false});
+cv.addEventListener('pointerup',endStroke);
+cv.addEventListener('pointercancel',endStroke);
+cv.addEventListener('lostpointercapture',endStroke);
+const stop=e=>{e.preventDefault();};
+document.addEventListener('contextmenu',stop);
+document.addEventListener('gesturestart',stop);
+document.addEventListener('gesturechange',stop);
+document.addEventListener('dblclick',stop);
+document.addEventListener('touchstart',e=>{if(e.touches.length>1)e.preventDefault();},{passive:false});
+document.addEventListener('touchmove',stop,{passive:false});
+document.addEventListener('selectstart',stop);
+
+// ---------- loop ----------
+let last=0,raf=0,running=true;
+function frame(now){
+  raf=0;if(!running)return;
+  let dt=(now-last)/1000;last=now;if(!(dt>0))dt=0;dt=Math.min(dt,0.05);
+  update(dt);render();raf=requestAnimationFrame(frame);
+}
+function update(dt){
+  G.t+=dt;
+  updateStrands(dt);updateUncle(dt);updatePieces(dt);updateRolling(dt);updateRubble(dt);
+  updateHouse(G.house,dt);for(const h of G.town)updateHouse(h,dt);
+  updateParticles(dt);updateSeq(dt);updateShift(dt);updateGuide(dt);
+  if(G.phase==='play')checkComplete();
+  // snapped ghosts cleanup
+  for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){const e=G.house.cells[r][c];if(e&&e.ghost&&!G.house.rubble.some(q=>q.state==='snap'&&q.tc===c&&q.tr===r))G.house.cells[r][c]=null;}
+}
+function start(){if(raf)cancelAnimationFrame(raf);running=true;last=performance.now();raf=requestAnimationFrame(frame);}
+document.addEventListener('visibilitychange',()=>{
+  if(document.hidden){running=false;if(raf)cancelAnimationFrame(raf);raf=0;activePointer=null;stroke=null;
+    try{if(AC&&AC.state==='running')AC.suspend();}catch(_){}}
+  else{activePointer=null;stroke=null;G.trail.length=0;G.lastInput=G.t;start();}
 });
+window.addEventListener('blur',()=>{activePointer=null;stroke=null;});
+window.addEventListener('resize',resize);
+window.addEventListener('orientationchange',()=>setTimeout(resize,120));
 
-/* ---------- 開始 ---------- */
-function init() {
-  S.tufts = makeTufts(WIGS[1], false);
-  const h = newHouse(0);
-  S.houses.push(h); S.cur = h;
-  layout();
-  S.hands[0].x = -6.3 * V; S.hands[0].y = L.headTop + 12.4 * V;
-  S.hands[1].x = 6.3 * V; S.hands[1].y = L.headTop + 12.4 * V;
-  S.hat.x = -L.mirrorX; S.hat.y = L.headTop + 74;
-  last = performance.now();
-  raf = requestAnimationFrame(loop);
-}
-// 自動テスト用の参照(画面には出ない)
-window.__G = {
-  S, L, V, CELL, WIGS,
-  toClient(x, y) { return { x: L.ox + x * K, y: L.oy + y * K }; },
-  tuftClient(t) { const g = tuftGeo(t); return { x: L.ox + g.x * K, root: L.oy + g.root * K, tip: L.oy + g.tip * K, k: K }; },
-  colHeight, wallH, restMax, X0
-};
-init();
+// ---------- boot ----------
+G.house=newHouse();G.strands=makeStrands(WIGS[1],1);G.lastInput=0;
+resize();start();
+
+// read-only hooks for automated checks
+window.__gf={G,UN,get layout(){return {U,foundX,floorY,W,H,DX,DY};},sGeom,H2S,sx,sy,topOf,houseHeight};
 })();
 </script>
 </body>
