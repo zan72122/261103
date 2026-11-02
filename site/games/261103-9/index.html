@@ -1,0 +1,1520 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta name="robots" content="noindex,nofollow">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#1b0f08">
+<title>どん、ちりん！ころころ音玉の大演奏会</title>
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#1b0f08;
+  overscroll-behavior:none;touch-action:none;-webkit-user-select:none;user-select:none;
+  -webkit-touch-callout:none;-webkit-tap-highlight-color:transparent;}
+body{position:fixed;inset:0;}
+canvas{position:absolute;left:0;top:0;width:100%;height:100%;display:block;touch-action:none;
+  -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;}
+#sa{position:absolute;left:0;top:0;width:0;height:0;visibility:hidden;pointer-events:none;
+  padding-top:env(safe-area-inset-top,0px);padding-right:env(safe-area-inset-right,0px);
+  padding-bottom:env(safe-area-inset-bottom,0px);padding-left:env(safe-area-inset-left,0px);}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="sa"></div>
+<script>
+(() => {
+'use strict';
+/* ============================================================
+   どん、ちりん！ころころ音玉の大演奏会
+   大太鼓→鉄玉(右・重い)  鈴→ガラス玉(左・軽い)  トライアングル→真ちゅう玉(左・中)
+   お盆が重さで傾く → 釣り合うと中央の溝が開く → 満杯/片寄りで流出 → 舞台が開き再演
+   ============================================================ */
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const saEl = document.getElementById('sa');
+
+/* ---------- utils ---------- */
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const ease = t => t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t);
+const mtof = m => 440 * Math.pow(2, (m - 69) / 12);
+function rng(seed) { return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const R0 = rng(7);
+
+/* ---------- constants ---------- */
+const WEIGHT = { iron: 4, brass: 2, glass: 1 };
+const SIDE = { iron: 'R', brass: 'L', glass: 'L' };
+const INSTMAT = { drum: 'iron', bell: 'glass', tri: 'brass' };
+const MAXA = 0.27;          // 最大傾き(rad)
+const TILTK = 2.4;          // 傾きの柔らかさ
+const BAL_TOL = 1;          // 釣り合いの余裕(重さ単位)
+const SIDE_CAP = 7;         // 片寄りで溢れる個数
+const FULL = 8;             // 満杯
+const SONG_MAX = 24;        // 一曲の上限(投入順は保持)
+const MAX_FLY = 10;
+const MAX_PART = 140;
+const FLY_DUR = 0.5;
+const DISP_DT = 0.34;       // 出口の間隔(発音順を守る)
+const DROP_DUR = 0.52;
+// 音階
+const BAR_SCALE = [55, 57, 60, 62, 64, 67, 69, 72];           // 木琴・鉄琴(ペンタトニック)
+const CHIME_SCALE = [62, 64, 66, 68, 69, 73, 76];            // 中央の特別な音階(リディア風)
+const BAR_REG = { iron: [0, 1, 2], brass: [3, 4], glass: [5, 6, 7] };
+const CHIME_REG = { iron: [0, 1], brass: [2, 3, 4], glass: [5, 6] };
+
+/* ---------- state ---------- */
+const S = {
+  t: 0, nextId: 1, balls: [], bowls: { L: [], R: [] }, pending: [],
+  tray: { ang: 0, vel: 0, sag: 0, sagV: 0, gate: 0, wob: 0 },
+  balanced: false, concert: null, stage: 0, rows: [], rowTried: false,
+  cycle: 0, goal: null, uses: { drum: 0, bell: 0, tri: 0 },
+  lastInput: -1, demoShown: false, demo: null,
+  parts: [], ev: [], inst: { drum: { hit: -99, pow: 0 }, bell: { hit: -99 }, tri: { hit: -99 } },
+  barGlow: { L: new Array(8).fill(-99), R: new Array(8).fill(-99), C: new Array(7).fill(-99) },
+  beadGlow: {}, reso: -99, trayTap: -99, rowTap: [-99, -99, -99],
+  log: [], releases: [], target: null, landings: 0, firstTap: -1, firstVisual: -1,
+};
+function at(delay, f) { S.ev.push({ t: S.t + delay, f }); }
+
+/* ---------- layout ---------- */
+const L = {};
+let W = 0, H = 0, DPR = 1;
+const C = {}; // caches
+function readSafe() {
+  const cs = getComputedStyle(saEl);
+  return { t: parseFloat(cs.paddingTop) || 0, r: parseFloat(cs.paddingRight) || 0, b: parseFloat(cs.paddingBottom) || 0, l: parseFloat(cs.paddingLeft) || 0 };
+}
+function layout() {
+  const sa = readSafe();
+  W = Math.max(1, window.innerWidth); H = Math.max(1, window.innerHeight);
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  const left = sa.l, right = W - sa.r, top = sa.t, bottom = H - sa.b;
+  const Wc = right - left, Hc = bottom - top, cx = left + Wc / 2;
+  const portrait = Hc > Wc * 1.05;
+  Object.assign(L, { left, right, top, bottom, Wc, Hc, cx, portrait });
+  let R, Lh;
+  if (portrait) {
+    L.pivotY = top + Hc * 0.145;
+    L.drumY = top + Hc * 0.5;
+    R = Math.min(Wc * 0.25, Hc * 0.13);
+    Lh = Wc * 0.42;
+    L.y0 = top + Hc * 0.72; L.y1 = top + Hc * 0.915;
+  } else {
+    L.pivotY = top + Hc * 0.13;
+    L.drumY = top + Hc * 0.5;
+    R = Math.min(Hc * 0.15, Wc * 0.13);
+    Lh = Math.min(Wc * 0.31, Hc * 0.62);
+    L.y0 = top + Hc * 0.73; L.y1 = top + Hc * 0.91;
+  }
+  L.R = R; L.Lh = Lh;
+  L.br = clamp(R * 0.15, 9, 22);
+  const br = L.br;
+  L.beamY = top + Math.max(4, Hc * 0.012); L.beamH = Math.max(10, Hc * 0.022);
+  L.hang = br * 1.9; L.th = br * 1.15;
+  L.bowlX = Math.min(Lh * 0.6, Lh - 4.3 * br);
+  L.sp = br * 2.1;
+  L.arcH = Hc * 0.07;
+  const s = clamp(R * 0.42, 24, 64);
+  if (portrait) {
+    L.bell = { x: left + Wc * 0.13, y: L.drumY - R * 0.05, s };
+    L.tri = { x: right - Wc * 0.13, y: L.drumY - R * 0.05, s };
+  } else {
+    L.bell = { x: cx - Wc * 0.25, y: L.drumY, s };
+    L.tri = { x: cx + Wc * 0.25, y: L.drumY, s };
+  }
+  L.lipH = Math.max(8, Hc * 0.018); L.slitH = Math.max(7, Hc * 0.013);
+  L.stTop = L.y0 + L.lipH;
+  L.insTop = L.stTop + 2; L.insBot = L.y1 - br * 2.5;
+  L.insH = Math.max(20, L.insBot - L.insTop);
+  const gap = br * 1.4, pad = Math.max(8, Wc * 0.02);
+  L.xylo = { x0: left + pad, x1: cx - gap / 2 };
+  L.metal = { x0: cx + gap / 2, x1: right - pad };
+  // バー
+  L.bars = { L: [], R: [] };
+  for (const side of ['L', 'R']) {
+    const a = side === 'L' ? L.xylo : L.metal;
+    const n = 8, aw = a.x1 - a.x0, bw = aw / n;
+    const cyI = (L.insTop + L.insBot) / 2;
+    for (let i = 0; i < n; i++) {
+      const h = L.insH * (1 - i * 0.055);
+      const xc = side === 'L' ? a.x0 + bw * (i + 0.5) : a.x1 - bw * (i + 0.5);
+      L.bars[side].push({ x: xc, y: cyI, w: bw * 0.8, h });
+    }
+  }
+  // 受け溝(演奏済みの並び)
+  L.trSp = br * 2.05;
+  L.trN = Math.max(6, Math.floor((Wc - 2 * pad - br) / L.trSp));
+  L.trX0 = cx - (L.trN - 1) * L.trSp / 2;
+  // 前の曲の棚
+  L.ledge = { y: L.y1, h: bottom - L.y1 };
+  L.slots = [];
+  for (let i = 0; i < 3; i++) L.slots.push({ x: left + Wc * i / 3, y: L.y1 + 2, w: Wc / 3, h: Math.max(30, bottom - L.y1 - 4) });
+  L.tiny = Math.min(br * 0.42, (Wc / 3 - 18) / (8 * 2.2));
+  // 中央のチャイム
+  L.chimes = [];
+  const cwid = Math.min(Lh * 0.46, Wc * 0.22);
+  for (let j = 0; j < 7; j++) L.chimes.push({ x: -cwid + (2 * cwid) * j / 6, len: br * (3.3 - j * 0.27) });
+  L.chimeY = L.hang + L.th + br * 0.55;
+  buildCaches();
+}
+
+/* ---------- canvas helpers ---------- */
+function mk(w, h) {
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.ceil(w * DPR)); c.height = Math.max(1, Math.ceil(h * DPR));
+  const g = c.getContext('2d'); g.scale(DPR, DPR);
+  return { c, g, w, h };
+}
+function woodGrain(g, x, y, w, h, base, dir, seed, opt = {}) {
+  const r = rng(seed);
+  const gr = dir === 'v' ? g.createLinearGradient(x, 0, x + w, 0) : g.createLinearGradient(0, y, 0, y + h);
+  gr.addColorStop(0, base[0]); gr.addColorStop(0.5, base[1]); gr.addColorStop(1, base[2] || base[0]);
+  g.fillStyle = gr; g.fillRect(x, y, w, h);
+  g.save(); g.beginPath(); g.rect(x, y, w, h); g.clip();
+  const n = opt.n || Math.ceil((dir === 'v' ? w : h) / 2.2);
+  for (let i = 0; i < n; i++) {
+    const a = 0.05 + r() * (opt.a || 0.16);
+    g.strokeStyle = r() < 0.7 ? `rgba(18,8,3,${a})` : `rgba(150,96,58,${a * 0.6})`;
+    g.lineWidth = 0.4 + r() * 1.4;
+    g.beginPath();
+    const off = r() * (dir === 'v' ? w : h), amp = 1 + r() * 4, fr = 0.004 + r() * 0.02, ph = r() * 6;
+    if (dir === 'v') {
+      for (let yy = y; yy <= y + h + 8; yy += 8) { const xx = x + off + Math.sin(yy * fr + ph) * amp + Math.sin(yy * fr * 3.1) * amp * 0.3; yy === y ? g.moveTo(xx, yy) : g.lineTo(xx, yy); }
+    } else {
+      for (let xx = x; xx <= x + w + 8; xx += 8) { const yy = y + off + Math.sin(xx * fr + ph) * amp + Math.sin(xx * fr * 2.7) * amp * 0.3; xx === x ? g.moveTo(xx, yy) : g.lineTo(xx, yy); }
+    }
+    g.stroke();
+  }
+  // 節(木目の渦)
+  const knots = opt.knots ?? 1;
+  for (let k = 0; k < knots; k++) {
+    const kx = x + r() * w, ky = y + r() * h, kr = 3 + r() * Math.min(w, h) * 0.08;
+    const kg = g.createRadialGradient(kx, ky, 0, kx, ky, kr);
+    kg.addColorStop(0, 'rgba(15,6,2,0.35)'); kg.addColorStop(1, 'rgba(15,6,2,0)');
+    g.fillStyle = kg; g.beginPath(); g.ellipse(kx, ky, dir === 'v' ? kr * 0.6 : kr * 1.6, dir === 'v' ? kr * 1.6 : kr * 0.6, 0, 0, 7); g.fill();
+  }
+  g.restore();
+}
+function shade(g, x, y, w, h, dir, stops) {
+  const gr = dir === 'v' ? g.createLinearGradient(0, y, 0, y + h) : g.createLinearGradient(x, 0, x + w, 0);
+  for (const [o, c] of stops) gr.addColorStop(o, c);
+  g.fillStyle = gr; g.fillRect(x, y, w, h);
+}
+
+/* ---------- caches ---------- */
+function buildCaches() {
+  buildBG(); buildBalls(); buildTray(); buildDrum(); buildGiant(); buildPanels();
+}
+function buildBG() {
+  const o = mk(W, H), g = o.g;
+  // 奥の壁:濃い胡桃色の板張り
+  const pw = Math.max(48, W / 8);
+  let i = 0;
+  for (let x = 0; x < W; x += pw, i++) {
+    const v = i % 2 ? ['#2c190e', '#3a2314', '#2a170c'] : ['#311c10', '#40271a', '#2d190e'];
+    woodGrain(g, x, 0, pw + 1, H, v, 'v', 100 + i, { a: 0.18, knots: 1 });
+    shade(g, x, 0, 6, H, 'h', [[0, 'rgba(8,3,1,0.55)'], [1, 'rgba(8,3,1,0)']]);
+    shade(g, x + pw - 3, 0, 3, H, 'h', [[0, 'rgba(120,80,50,0)'], [1, 'rgba(120,80,50,0.12)']]);
+  }
+  // 上からの柔らかな光と周辺の陰
+  let rg = g.createRadialGradient(W / 2, L.pivotY, 10, W / 2, H * 0.45, Math.max(W, H) * 0.75);
+  rg.addColorStop(0, 'rgba(255,190,120,0.10)'); rg.addColorStop(0.5, 'rgba(0,0,0,0)'); rg.addColorStop(1, 'rgba(0,0,0,0.55)');
+  g.fillStyle = rg; g.fillRect(0, 0, W, H);
+  // 梁
+  const by = L.beamY, bh = L.beamH;
+  woodGrain(g, 0, 0, W, by + bh, ['#24140a', '#4a2c19', '#2a170c'], 'h', 300, { a: 0.2 });
+  shade(g, 0, by + bh, W, bh * 0.8, 'v', [[0, 'rgba(0,0,0,0.5)'], [1, 'rgba(0,0,0,0)']]);
+  shade(g, 0, by + bh * 0.1, W, bh * 0.25, 'v', [[0, 'rgba(255,200,140,0)'], [0.5, 'rgba(255,200,140,0.12)'], [1, 'rgba(255,200,140,0)']]);
+  // 舞台の奥(開いたときの暗がり)
+  const y0 = L.y0, st = L.stTop, y1 = L.y1;
+  shade(g, 0, st, W, y1 - st, 'v', [[0, '#0b0503'], [0.6, '#160b06'], [1, '#22130a']]);
+  rg = g.createRadialGradient(W / 2, y1, 5, W / 2, y1, W * 0.6);
+  rg.addColorStop(0, 'rgba(120,70,30,0.25)'); rg.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = rg; g.fillRect(0, st, W, y1 - st);
+  // 受け溝(舞台前の溝)
+  const ty = y1 - L.br * 1.05;
+  shade(g, 0, ty - L.br * 0.2, W, L.br * 1.5, 'v', [[0, 'rgba(0,0,0,0)'], [0.5, 'rgba(60,35,18,0.55)'], [1, 'rgba(0,0,0,0.6)']]);
+  // 舞台の縁(リップ)
+  woodGrain(g, 0, y0, W, L.lipH, ['#5a3620', '#6e4428', '#3a2213'], 'h', 400, { a: 0.2 });
+  shade(g, 0, y0, W, 2, 'v', [[0, 'rgba(255,210,160,0.35)'], [1, 'rgba(255,210,160,0)']]);
+  shade(g, 0, y0 - L.lipH * 0.6, W, L.lipH * 0.6, 'v', [[0, 'rgba(0,0,0,0)'], [1, 'rgba(0,0,0,0.35)']]);
+  // 前の曲の棚
+  woodGrain(g, 0, y1, W, H - y1, ['#4a2c18', '#3a2213', '#26150b'], 'h', 500, { a: 0.18 });
+  shade(g, 0, y1, W, 3, 'v', [[0, 'rgba(255,210,160,0.3)'], [1, 'rgba(255,210,160,0)']]);
+  for (const sl of L.slots) {
+    const cyy = sl.y + sl.h / 2;
+    const gg = g.createLinearGradient(0, cyy - L.tiny * 4, 0, cyy + L.tiny * 4);
+    gg.addColorStop(0, 'rgba(0,0,0,0)'); gg.addColorStop(0.5, 'rgba(10,4,1,0.35)'); gg.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = gg; g.fillRect(sl.x + 10, cyy - L.tiny * 4, sl.w - 20, L.tiny * 8);
+  }
+  C.bg = o;
+}
+function ballSprite(mat, r) {
+  const s = Math.ceil(r * 2 + 4), o = mk(s, s), g = o.g, c = s / 2;
+  const circ = () => { g.beginPath(); g.arc(c, c, r, 0, 7); };
+  let gr;
+  if (mat === 'iron') {
+    gr = g.createRadialGradient(c - r * 0.38, c - r * 0.42, r * 0.05, c, c, r);
+    gr.addColorStop(0, '#c9ccce'); gr.addColorStop(0.28, '#8d9296'); gr.addColorStop(0.72, '#4b4f53'); gr.addColorStop(1, '#222426');
+    g.fillStyle = gr; circ(); g.fill();
+    g.save(); circ(); g.clip();
+    gr = g.createRadialGradient(c, c + r * 0.85, 0, c, c + r * 0.85, r * 0.9);
+    gr.addColorStop(0, 'rgba(150,88,45,0.5)'); gr.addColorStop(1, 'rgba(150,88,45,0)');
+    g.fillStyle = gr; g.fillRect(0, 0, s, s);
+    const rr = rng(11);
+    for (let i = 0; i < 26; i++) { g.fillStyle = `rgba(${rr() < 0.5 ? '20,20,22' : '200,200,205'},${0.05 + rr() * 0.08})`; g.fillRect(c - r + rr() * 2 * r, c - r + rr() * 2 * r, 1, 1); }
+    g.restore();
+    gr = g.createRadialGradient(c - r * 0.4, c - r * 0.45, 0, c - r * 0.4, c - r * 0.45, r * 0.38);
+    gr.addColorStop(0, 'rgba(255,255,255,0.45)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = gr; circ(); g.fill();
+  } else if (mat === 'brass') {
+    gr = g.createRadialGradient(c - r * 0.35, c - r * 0.4, r * 0.05, c, c, r);
+    gr.addColorStop(0, '#fff0b0'); gr.addColorStop(0.3, '#e0ad45'); gr.addColorStop(0.75, '#93621a'); gr.addColorStop(1, '#4b300a');
+    g.fillStyle = gr; circ(); g.fill();
+    g.save(); circ(); g.clip();
+    gr = g.createRadialGradient(c, c + r * 0.85, 0, c, c + r * 0.85, r * 0.9);
+    gr.addColorStop(0, 'rgba(120,60,20,0.45)'); gr.addColorStop(1, 'rgba(120,60,20,0)');
+    g.fillStyle = gr; g.fillRect(0, 0, s, s);
+    g.restore();
+  } else {
+    gr = g.createRadialGradient(c, c, r * 0.15, c, c, r);
+    gr.addColorStop(0, 'rgba(215,236,245,0.06)'); gr.addColorStop(0.6, 'rgba(190,220,235,0.12)'); gr.addColorStop(0.9, 'rgba(165,205,225,0.38)'); gr.addColorStop(1, 'rgba(225,242,252,0.6)');
+    g.fillStyle = gr; circ(); g.fill();
+    g.save(); circ(); g.clip();
+    // 内部の屈折(逆さまの舞台)
+    gr = g.createRadialGradient(c, c - r * 0.25, 0, c, c - r * 0.25, r * 0.75);
+    gr.addColorStop(0, 'rgba(70,38,18,0.32)'); gr.addColorStop(1, 'rgba(70,38,18,0)');
+    g.fillStyle = gr; g.fillRect(0, 0, s, s);
+    gr = g.createRadialGradient(c + r * 0.12, c + r * 0.55, 0, c + r * 0.12, c + r * 0.55, r * 0.42);
+    gr.addColorStop(0, 'rgba(255,236,190,0.8)'); gr.addColorStop(1, 'rgba(255,236,190,0)');
+    g.fillStyle = gr; g.fillRect(0, 0, s, s);
+    g.strokeStyle = 'rgba(255,255,255,0.32)'; g.lineWidth = r * 0.09; g.lineCap = 'round';
+    g.beginPath(); g.arc(c, c, r * 0.78, 2.1, 3.1); g.stroke();
+    g.restore();
+  }
+  // 鏡面ハイライト
+  g.fillStyle = mat === 'glass' ? 'rgba(255,255,255,0.92)' : 'rgba(255,255,250,0.7)';
+  g.beginPath(); g.ellipse(c - r * 0.38, c - r * 0.45, r * 0.2, r * 0.12, -0.6, 0, 7); g.fill();
+  return o;
+}
+function bandSprite(r) {
+  const s = Math.ceil(r * 2 + 4), o = mk(s, s), g = o.g, c = s / 2;
+  g.save(); g.beginPath(); g.arc(c, c, r, 0, 7); g.clip();
+  const gr = g.createLinearGradient(0, c - r * 0.16, 0, c + r * 0.16);
+  gr.addColorStop(0, 'rgba(80,45,8,0)'); gr.addColorStop(0.35, 'rgba(80,45,8,0.45)'); gr.addColorStop(0.55, 'rgba(255,230,150,0.35)'); gr.addColorStop(1, 'rgba(80,45,8,0)');
+  g.fillStyle = gr; g.fillRect(0, c - r * 0.16, s, r * 0.32);
+  g.fillStyle = 'rgba(70,40,8,0.5)'; g.beginPath(); g.arc(c + r * 0.55, c, r * 0.09, 0, 7); g.fill();
+  g.restore();
+  return o;
+}
+function buildBalls() {
+  C.ball = { iron: ballSprite('iron', L.br), brass: ballSprite('brass', L.br), glass: ballSprite('glass', L.br) };
+  C.band = bandSprite(L.br);
+}
+// お盆(左右半分ずつ描くためローカル座標で一枚)
+function buildTray() {
+  const { Lh, br, th, hang, bowlX } = L;
+  const cap = br * 0.55, m = br * 1.2;
+  const w = 2 * Lh + 2 * cap + 4, h = th + m + 4;
+  const o = mk(w, h), g = o.g;
+  const ox = Lh + cap + 2, oy = m - hang; // local(x,y) -> (x+ox, y+oy)
+  C.trayOX = ox; C.trayOY = oy;
+  const top = hang + oy, bot = hang + th + oy;
+  const dip = (x) => { let d = 0; for (const s of [-1, 1]) { const u = (x - s * bowlX) / (br * 4.4); if (Math.abs(u) < 1) d += (Math.cos(u * Math.PI) + 1) / 2; } return d * br * 0.38; };
+  const body = () => {
+    g.beginPath(); g.moveTo(-Lh + ox, top);
+    for (let x = -Lh; x <= Lh; x += 3) g.lineTo(x + ox, top + dip(x));
+    g.lineTo(Lh + ox, bot - br * 0.15); g.quadraticCurveTo(Lh + ox, bot, Lh + ox - br * 0.3, bot);
+    g.lineTo(-Lh + ox + br * 0.3, bot); g.quadraticCurveTo(-Lh + ox, bot, -Lh + ox, bot - br * 0.15); g.closePath();
+  };
+  g.save(); body(); g.clip();
+  woodGrain(g, 0, top - 2, w, th + br, ['#6a4126', '#7c4e2e', '#3e2312'], 'h', 900, { n: 40, a: 0.22 });
+  // 正面の記録溝
+  const gy = top + th * 0.52;
+  shade(g, 0, gy - br * 0.34, w, br * 0.68, 'v', [[0, 'rgba(10,4,1,0.55)'], [0.5, 'rgba(25,12,5,0.75)'], [0.85, 'rgba(10,4,1,0.4)'], [1, 'rgba(255,200,150,0.12)']]);
+  shade(g, 0, top, w, br * 0.35, 'v', [[0, 'rgba(255,215,170,0.35)'], [1, 'rgba(255,215,170,0)']]);
+  shade(g, 0, bot - br * 0.3, w, br * 0.3, 'v', [[0, 'rgba(0,0,0,0)'], [1, 'rgba(0,0,0,0.45)']]);
+  g.restore();
+  // 器のくぼみの影
+  for (const s of [-1, 1]) {
+    const cxp = s * bowlX + ox;
+    const rg = g.createRadialGradient(cxp, top + br * 0.1, 0, cxp, top + br * 0.1, br * 4.2);
+    rg.addColorStop(0, 'rgba(20,8,2,0.35)'); rg.addColorStop(1, 'rgba(20,8,2,0)');
+    g.fillStyle = rg; g.beginPath(); g.ellipse(cxp, top + br * 0.15, br * 4.3, br * 0.5, 0, 0, 7); g.fill();
+  }
+  // 真ちゅうの端の壁
+  for (const s of [-1, 1]) {
+    const x = s < 0 ? -Lh - cap + ox : Lh + ox;
+    const gr = g.createLinearGradient(x, 0, x + cap, 0);
+    gr.addColorStop(0, '#6b4610'); gr.addColorStop(0.4, '#f0cc70'); gr.addColorStop(0.7, '#b98a2c'); gr.addColorStop(1, '#5a3a0c');
+    g.fillStyle = gr;
+    g.beginPath(); g.moveTo(x, top - br * 0.9); g.lineTo(x + cap, top - br * 0.9); g.lineTo(x + cap, bot); g.lineTo(x, bot); g.closePath(); g.fill();
+    shade(g, x, top - br * 0.9, cap, br * 0.25, 'v', [[0, 'rgba(255,245,200,0.6)'], [1, 'rgba(255,245,200,0)']]);
+  }
+  C.tray = o;
+}
+function buildDrum() {
+  const R = L.R, s = Math.ceil(R * 2.2), o = mk(s, s), g = o.g, c = s / 2;
+  // 胴の輪
+  let gr = g.createRadialGradient(c - R * 0.2, c - R * 0.25, R * 0.6, c, c, R * 1.02);
+  gr.addColorStop(0, '#6e3a1e'); gr.addColorStop(0.6, '#4e2612'); gr.addColorStop(0.9, '#2d140a'); gr.addColorStop(1, '#1a0a04');
+  g.fillStyle = gr; g.beginPath(); g.arc(c, c, R, 0, 7); g.fill();
+  g.save(); g.beginPath(); g.arc(c, c, R, 0, 7); g.arc(c, c, R * 0.8, 0, 7, true); g.clip();
+  const r = rng(21);
+  for (let i = 0; i < 70; i++) {
+    const a0 = r() * 7, rad = R * (0.8 + r() * 0.2);
+    g.strokeStyle = `rgba(${r() < 0.6 ? '15,5,1' : '150,80,40'},${0.06 + r() * 0.14})`; g.lineWidth = 0.5 + r();
+    g.beginPath(); g.arc(c, c, rad, a0, a0 + 0.4 + r() * 1.2); g.stroke();
+  }
+  gr = g.createLinearGradient(c - R, c - R, c + R, c + R);
+  gr.addColorStop(0, 'rgba(255,200,150,0.18)'); gr.addColorStop(0.5, 'rgba(255,200,150,0)'); gr.addColorStop(1, 'rgba(0,0,0,0.3)');
+  g.fillStyle = gr; g.fillRect(0, 0, s, s);
+  g.restore();
+  // 鋲(鉄)
+  for (let row = 0; row < 2; row++) {
+    const rad = R * (row ? 0.95 : 0.845), n = row ? 26 : 22;
+    for (let i = 0; i < n; i++) {
+      const a = i / n * Math.PI * 2 + row * 0.12, x = c + Math.cos(a) * rad, y = c + Math.sin(a) * rad, tr = R * 0.034;
+      const tg = g.createRadialGradient(x - tr * 0.4, y - tr * 0.4, 0, x, y, tr);
+      tg.addColorStop(0, '#e0e2e4'); tg.addColorStop(0.4, '#8b9094'); tg.addColorStop(1, '#2a2c2e');
+      g.fillStyle = tg; g.beginPath(); g.arc(x, y, tr, 0, 7); g.fill();
+    }
+  }
+  C.drumShell = o;
+  // 打面(革)
+  const hs = Math.ceil(R * 1.7), ho = mk(hs, hs), hg = ho.g, hc = hs / 2, hr = R * 0.8;
+  gr = hg.createRadialGradient(hc - hr * 0.3, hc - hr * 0.35, hr * 0.05, hc, hc, hr);
+  gr.addColorStop(0, '#d9c49a'); gr.addColorStop(0.55, '#bda278'); gr.addColorStop(0.9, '#8a6c45'); gr.addColorStop(1, '#5e4428');
+  hg.fillStyle = gr; hg.beginPath(); hg.arc(hc, hc, hr, 0, 7); hg.fill();
+  hg.save(); hg.beginPath(); hg.arc(hc, hc, hr, 0, 7); hg.clip();
+  const r2 = rng(33);
+  for (let i = 0; i < 60; i++) {
+    const x = hc + (r2() - 0.5) * 2 * hr, y = hc + (r2() - 0.5) * 2 * hr, rr = 3 + r2() * hr * 0.25;
+    const bg = hg.createRadialGradient(x, y, 0, x, y, rr);
+    bg.addColorStop(0, `rgba(${r2() < 0.5 ? '90,60,30' : '240,220,180'},${0.04 + r2() * 0.06})`); bg.addColorStop(1, 'rgba(0,0,0,0)');
+    hg.fillStyle = bg; hg.fillRect(x - rr, y - rr, rr * 2, rr * 2);
+  }
+  hg.restore();
+  C.drumHead = ho;
+}
+function buildGiant() {
+  for (const side of ['L', 'R']) {
+    const a = side === 'L' ? L.xylo : L.metal;
+    const pad = 4, x0 = a.x0 - pad, w = a.x1 - a.x0 + pad * 2, y0 = L.insTop - pad, h = L.insH + pad * 2 + L.br;
+    const o = mk(w, h), g = o.g;
+    const bars = L.bars[side];
+    // 枠のレール(左右の高さに沿って傾く)
+    for (const f of [0.22, 0.78]) {
+      const b0 = bars[0], b7 = bars[7];
+      const ya = b0.y - b0.h / 2 + b0.h * f - y0, yb = b7.y - b7.h / 2 + b7.h * f - y0;
+      g.save();
+      const xa = b0.x - x0, xb = b7.x - x0;
+      const ang = Math.atan2(yb - ya, xb - xa), len = Math.hypot(xb - xa, yb - ya) + b0.w * 1.6;
+      g.translate((xa + xb) / 2, (ya + yb) / 2); g.rotate(ang);
+      if (side === 'L') woodGrain(g, -len / 2, -L.br * 0.28, len, L.br * 0.56, ['#2a160a', '#4a2b17', '#1f0f06'], 'h', 70 + f * 10, { n: 6, knots: 0 });
+      else { const gr = g.createLinearGradient(0, -L.br * 0.28, 0, L.br * 0.28); gr.addColorStop(0, '#6b6f72'); gr.addColorStop(0.4, '#2e3133'); gr.addColorStop(1, '#151617'); g.fillStyle = gr; g.fillRect(-len / 2, -L.br * 0.28, len, L.br * 0.56); }
+      g.restore();
+    }
+    bars.forEach((b, i) => {
+      const bx = b.x - b.w / 2 - x0, by = b.y - b.h / 2 - y0;
+      g.save();
+      const rr = Math.min(b.w * 0.25, 6);
+      g.beginPath(); g.roundRect ? g.roundRect(bx, by, b.w, b.h, rr) : g.rect(bx, by, b.w, b.h); g.clip();
+      if (side === 'L') {
+        woodGrain(g, bx, by, b.w, b.h, ['#8a4526', '#a65a31', '#5e2a14'], 'v', 600 + i, { n: Math.ceil(b.w / 2), a: 0.2, knots: 0 });
+        shade(g, bx, by, b.w, b.h, 'h', [[0, 'rgba(0,0,0,0.35)'], [0.3, 'rgba(255,200,150,0.18)'], [0.5, 'rgba(0,0,0,0)'], [1, 'rgba(0,0,0,0.45)']]);
+      } else {
+        shade(g, bx, by, b.w, b.h, 'h', [[0, '#3b3f42'], [0.18, '#c9ced2'], [0.32, '#eef1f3'], [0.5, '#8d9398'], [0.75, '#5a5f63'], [1, '#2a2d2f']]);
+        // 木の舞台の映り込み
+        shade(g, bx, by, b.w, b.h, 'v', [[0, 'rgba(120,70,35,0)'], [0.6, 'rgba(120,70,35,0.0)'], [0.85, 'rgba(120,70,35,0.28)'], [1, 'rgba(60,30,10,0.4)']]);
+      }
+      shade(g, bx, by, b.w, Math.min(6, b.h * 0.1), 'v', [[0, 'rgba(255,240,210,0.4)'], [1, 'rgba(255,240,210,0)']]);
+      // 下の影
+      shade(g, bx, by + b.h - 5, b.w, 5, 'v', [[0, 'rgba(0,0,0,0)'], [1, 'rgba(0,0,0,0.5)']]);
+      g.restore();
+      // 紐を通す穴(暗いくぼみ)
+      for (const f of [0.22, 0.78]) {
+        const hy = by + b.h * f, hx = bx + b.w / 2, hr = Math.min(b.w * 0.12, 3.5);
+        const hgd = g.createRadialGradient(hx, hy, 0, hx, hy, hr);
+        hgd.addColorStop(0, 'rgba(5,2,0,0.9)'); hgd.addColorStop(1, 'rgba(5,2,0,0)');
+        g.fillStyle = hgd; g.beginPath(); g.arc(hx, hy, hr, 0, 7); g.fill();
+      }
+    });
+    C['giant' + side] = { o, x: x0, y: y0 };
+  }
+}
+function buildPanels() {
+  const top = L.stTop + L.slitH, h = L.y1 - top;
+  for (const side of ['L', 'R']) {
+    const w = W / 2 + 2, o = mk(w, h), g = o.g;
+    const ph = Math.max(14, h / 5);
+    let i = 0;
+    for (let y = 0; y < h; y += ph, i++) {
+      woodGrain(g, 0, y, w, ph + 1, i % 2 ? ['#3e2414', '#52311c', '#2e1a0c'] : ['#432817', '#573520', '#311b0d'], 'h', 800 + i + (side === 'L' ? 0 : 50), { a: 0.2 });
+      shade(g, 0, y, w, 2.5, 'v', [[0, 'rgba(255,205,150,0.18)'], [1, 'rgba(255,205,150,0)']]);
+      shade(g, 0, y + ph - 3, w, 3, 'v', [[0, 'rgba(0,0,0,0)'], [1, 'rgba(0,0,0,0.5)']]);
+    }
+    // 合わせ目の陰
+    if (side === 'L') shade(g, w - 8, 0, 8, h, 'h', [[0, 'rgba(0,0,0,0)'], [1, 'rgba(0,0,0,0.55)']]);
+    else shade(g, 0, 0, 8, h, 'h', [[0, 'rgba(0,0,0,0.55)'], [1, 'rgba(0,0,0,0)']]);
+    shade(g, 0, 0, w, h * 0.25, 'v', [[0, 'rgba(0,0,0,0.45)'], [1, 'rgba(0,0,0,0)']]);
+    C['panel' + side] = { o, y: top };
+  }
+}
+
+/* ---------- tray geometry ---------- */
+function trayAngFor(xl) { return S.tray.ang + (xl < 0 ? -1 : xl > 0 ? 1 : 0) * S.tray.sag; }
+function trayWorld(xl, yl) {
+  const a = trayAngFor(xl), c = Math.cos(a), s = Math.sin(a);
+  return { x: L.cx + xl * c - yl * s, y: L.pivotY + xl * s + yl * c };
+}
+const PYR = [[-0.5, 0], [0.5, 0], [-1.5, 0], [1.5, 0], [-1, 1], [0, 1], [1, 1], [-0.5, 2], [0.5, 2], [0, 3], [-1, 3], [1, 3]];
+function bowlLocal(side, k) {
+  const p = PYR[Math.min(k, PYR.length - 1)];
+  const extra = k >= PYR.length ? (k - PYR.length + 1) * 0.3 : 0;
+  return { x: (side === 'L' ? -1 : 1) * L.bowlX + p[0] * 2.02 * L.br, y: L.hang - L.br * 0.62 - (p[1] + extra) * 1.74 * L.br };
+}
+function lineLocal(path, i) {
+  const { Lh, br, sp, hang } = L;
+  if (path === 'C') {
+    const n = Math.max(3, Math.floor((Lh - br) / sp) + 1);
+    const row = Math.min(3, Math.floor(i / n)), j = i % n;
+    return { x: j * sp, y: hang - br - row * 1.75 * br };
+  }
+  const n = Math.max(4, Math.floor((2 * Lh - 2 * br) / sp) + 1);
+  const row = Math.min(3, Math.floor(i / n)), j = i % n;
+  const x = -Lh + br * 1.05 + j * sp;
+  return { x: path === 'L' ? x : -x, y: hang - br - row * 1.75 * br };
+}
+function chimeHit(j) {
+  const ch = L.chimes[j];
+  return trayWorld(ch.x - L.br * 1.05, L.chimeY + ch.len * 0.5);
+}
+function barPos(side, i) {
+  const b = L.bars[side][i];
+  return { x: b.x, y: b.y + giantOff() - b.h * 0.12 };
+}
+function giantOff() { return (1 - ease(S.stage)) * L.slitH * 0.3 - Math.sin(clamp(S.stage, 0, 1) * Math.PI) * L.br * 0.5; }
+function troughPos(k) {
+  const n = L.trN, row = Math.min(2, Math.floor(k / n)), j = k % n;
+  return { x: L.trX0 + j * L.trSp + (row % 2) * L.trSp * 0.5, y: L.y1 - L.br * 1.05 - row * 1.6 * L.br };
+}
+function rowBallPos(slot, k, n) {
+  const sl = L.slots[slot], tr = L.tiny, cols = Math.min(8, n), lines = Math.ceil(n / 8);
+  const col = k % 8, line = Math.floor(k / 8);
+  const rowCols = line < lines - 1 ? 8 : n - line * 8;
+  return { x: sl.x + sl.w / 2 + (col - (rowCols - 1) / 2) * tr * 2.25, y: sl.y + sl.h / 2 + (line - (lines - 1) / 2) * tr * 2.15 };
+}
+function emitPoint(inst) {
+  if (inst === 'drum') return { x: L.cx + L.R * 0.12, y: L.drumY - L.R * 0.2 };
+  if (inst === 'bell') return { x: L.bell.x, y: L.bell.y - L.bell.s * 0.75 };
+  return { x: L.tri.x, y: L.tri.y - L.tri.s * 0.15 };
+}
+
+/* ---------- tray stats ---------- */
+function trayStats(includeFlying) {
+  let nL = 0, nR = 0, wL = 0, wR = 0;
+  for (const side of ['L', 'R']) for (const b of S.bowls[side]) {
+    if (!includeFlying && b.state !== 'bowl') continue;
+    if (side === 'L') { nL++; wL += WEIGHT[b.mat]; } else { nR++; wR += WEIGHT[b.mat]; }
+  }
+  const d = wR - wL;
+  return { nL, nR, wL, wR, d, total: nL + nR, bal: nL > 0 && nR > 0 && Math.abs(d) <= BAL_TOL };
+}
+
+/* ============================================================
+   AUDIO (Web Audio 合成)
+   ============================================================ */
+let AC = null, master = null, rvIn = null, NB = null;
+const voices = [];
+function initAudio() {
+  if (AC) { if (AC.state !== 'running') { try { AC.resume(); } catch (e) {} } return; }
+  const A = window.AudioContext || window.webkitAudioContext;
+  if (!A) return;
+  try { AC = new A(); } catch (e) { AC = null; return; }
+  try {
+    const comp = AC.createDynamicsCompressor();
+    comp.threshold.value = -16; comp.knee.value = 12; comp.ratio.value = 4; comp.attack.value = 0.004; comp.release.value = 0.2;
+    master = AC.createGain(); master.gain.value = 0.75;
+    master.connect(comp); comp.connect(AC.destination);
+    const conv = AC.createConvolver();
+    const len = Math.floor(AC.sampleRate * 2.0), ir = AC.createBuffer(2, len, AC.sampleRate);
+    for (let ch = 0; ch < 2; ch++) { const d = ir.getChannelData(ch); for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2.6); }
+    conv.buffer = ir;
+    const wet = AC.createGain(); wet.gain.value = 0.28;
+    rvIn = AC.createGain(); rvIn.connect(master); rvIn.connect(conv); conv.connect(wet); wet.connect(master);
+    NB = AC.createBuffer(1, AC.sampleRate * 2, AC.sampleRate);
+    const nd = NB.getChannelData(0); for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+    // iOS 解錠用の無音
+    const sb = AC.createBufferSource(); sb.buffer = AC.createBuffer(1, 1, 22050); sb.connect(AC.destination); sb.start(0);
+    if (AC.state !== 'running') AC.resume();
+  } catch (e) { AC = null; }
+}
+function canPlay(n, dur, prio) {
+  if (!AC || !master || AC.state !== 'running') return false;
+  const now = AC.currentTime;
+  for (let i = voices.length - 1; i >= 0; i--) if (voices[i].e < now) voices.splice(i, 1);
+  let sum = 0; for (const v of voices) sum += v.n;
+  if (sum + n > (prio ? 90 : 60)) return false;
+  voices.push({ n, e: now + dur });
+  return true;
+}
+function env(g, t0, a, peak, dec) {
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), t0 + a);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + a + dec);
+}
+function tone(f, t0, peak, dec, type, dest, att, f1) {
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type || 'sine'; o.frequency.setValueAtTime(f, t0);
+  if (f1) o.frequency.exponentialRampToValueAtTime(f1, t0 + Math.min(dec, 0.45));
+  env(g, t0, att || 0.004, peak, dec);
+  o.connect(g); g.connect(dest || master); o.start(t0); o.stop(t0 + (att || 0.004) + dec + 0.05);
+}
+function noise(t0, dur, peak, ft, f, q, dest, f1) {
+  const s = AC.createBufferSource(); s.buffer = NB;
+  const fl = AC.createBiquadFilter(); fl.type = ft; fl.frequency.setValueAtTime(f, t0); fl.Q.value = q || 1;
+  if (f1) fl.frequency.exponentialRampToValueAtTime(f1, t0 + dur);
+  const g = AC.createGain(); env(g, t0, 0.004, peak, dur);
+  s.connect(fl); fl.connect(g); g.connect(dest || master); s.start(t0, Math.random() * 1.2); s.stop(t0 + dur + 0.06);
+}
+function partials(f, t0, parts, vol, dest) {
+  for (const [r, a, d] of parts) tone(f * r, t0, a * vol, d, 'sine', dest);
+}
+const SND = {
+  drum(p) {
+    if (!canPlay(5, 1.6, true)) return;
+    const t = AC.currentTime + 0.005, m = p || 1;
+    tone(118 * m, t, 0.95, 1.1, 'sine', rvIn, 0.003, 46 * m);
+    tone(76 * m, t, 0.55, 1.5, 'sine', master, 0.004, 40 * m);
+    noise(t, 0.13, 0.55, 'lowpass', 380, 0.7);
+    noise(t, 0.05, 0.12, 'bandpass', 1100, 1.2);
+  },
+  bell(p) {
+    if (!canPlay(12, 0.7, true)) return;
+    const t = AC.currentTime + 0.005, m = p || 1;
+    const offs = [0, 0.045, 0.095, 0.15, 0.22, 0.31];
+    offs.forEach((o, k) => {
+      const a = 0.15 * (1 - k * 0.13), j = 1 + (R0() - 0.5) * 0.04;
+      tone(3150 * m * j, t + o, a, 0.13 + R0() * 0.05, 'sine', rvIn);
+      tone(4720 * m * j, t + o, a * 0.45, 0.09, 'sine', rvIn);
+    });
+    noise(t, 0.3, 0.035, 'highpass', 6000, 0.7);
+  },
+  tri(p) {
+    if (!canPlay(5, 3, true)) return;
+    const t = AC.currentTime + 0.005, m = p || 1;
+    partials(1320 * m, t, [[1, 0.13, 2.8], [1.003, 0.06, 2.6], [2.43, 0.07, 2.1], [3.9, 0.05, 1.5], [5.6, 0.03, 1.0]], 1, rvIn);
+  },
+  land(mat, m, vol) {
+    if (!canPlay(4, 0.5, false)) return;
+    const t = AC.currentTime + 0.003, v = vol || 1;
+    if (mat === 'iron') {
+      tone(190 * m, t, 0.45 * v, 0.24, 'sine', rvIn, 0.002, 150 * m);
+      tone(95 * m, t, 0.3 * v, 0.3, 'sine');
+      noise(t, 0.07, 0.25 * v, 'lowpass', 1300);
+    } else if (mat === 'brass') {
+      partials(760 * m, t, [[1, 0.18, 0.75], [2.32, 0.09, 0.5], [3.9, 0.05, 0.3]], v, rvIn);
+    } else {
+      partials(2350 * m, t, [[1, 0.13, 0.16], [2.71, 0.05, 0.1]], v, rvIn);
+      tone(2390 * m, t + 0.11, 0.06 * v, 0.1, 'sine', rvIn);
+      tone(2420 * m, t + 0.19, 0.03 * v, 0.08, 'sine', rvIn);
+    }
+    tone(300 * m, t, 0.12 * v, 0.07, 'triangle');
+  },
+  xylo(midi, mat) {
+    if (!canPlay(4, 0.6, true)) return;
+    const t = AC.currentTime + 0.003, f = mtof(midi + 12);
+    tone(f, t, 0.4, 0.5, 'sine', rvIn, 0.002);
+    tone(f * 3, t, 0.08, 0.14, 'sine', rvIn, 0.002);
+    noise(t, 0.035, 0.12, 'bandpass', Math.min(9000, f * 4), 2);
+    SND.matTick(mat, t);
+  },
+  metal(midi, mat) {
+    if (!canPlay(4, 1.9, true)) return;
+    const t = AC.currentTime + 0.003, f = mtof(midi + 12);
+    partials(f, t, [[1, 0.3, 1.8], [2.76, 0.08, 0.8], [5.4, 0.03, 0.35]], 1, rvIn);
+    SND.matTick(mat, t);
+  },
+  chime(midi, mat, vol) {
+    if (!canPlay(5, 2.4, true)) return;
+    const t = AC.currentTime + 0.003, f = mtof(midi + 12), v = vol || 1;
+    partials(f, t, [[1, 0.15, 2.4], [1.004, 0.07, 2.2], [2.0, 0.09, 1.7], [3.0, 0.06, 1.3], [4.16, 0.04, 0.9]], v, rvIn);
+    if (mat) SND.matTick(mat, t);
+  },
+  matTick(mat, t) {
+    if (mat === 'iron') tone(160, t, 0.18, 0.08, 'sine');
+    else if (mat === 'brass') tone(900, t, 0.06, 0.12, 'sine');
+    else if (mat === 'glass') tone(2600, t, 0.05, 0.06, 'sine');
+  },
+  success() {
+    if (!canPlay(14, 2.2, true)) return;
+    const t = AC.currentTime + 0.01;
+    [74, 78, 81, 85, 88, 90].forEach((m, i) => { const f = mtof(m); tone(f, t + i * 0.06, 0.12, 0.9, 'sine', rvIn); tone(f * 2, t + i * 0.06, 0.04, 0.5, 'sine', rvIn); });
+    tone(mtof(50), t, 0.16, 1.8, 'sine', rvIn, 0.05); tone(mtof(50) * 1.006, t, 0.1, 1.8, 'sine', rvIn, 0.05);
+  },
+  gate(open) {
+    if (!canPlay(3, 0.4, true)) return;
+    const t = AC.currentTime + 0.005;
+    noise(t, 0.25, 0.08, 'bandpass', open ? 700 : 2200, 3, master, open ? 2400 : 700);
+    tone(open ? 1800 : 1200, t + 0.2, 0.06, 0.08, 'sine');
+  },
+  spill() {
+    if (!canPlay(10, 0.8, true)) return;
+    const t = AC.currentTime + 0.005;
+    for (let i = 0; i < 7; i++) tone(260 + R0() * 260, t + i * 0.05 + R0() * 0.02, 0.12, 0.07, 'triangle');
+    noise(t, 0.6, 0.12, 'lowpass', 400, 1, master, 1800);
+  },
+  stage() {
+    if (!canPlay(14, 1.6, true)) return;
+    const t = AC.currentTime + 0.01;
+    noise(t, 1.1, 0.25, 'lowpass', 140, 1);
+    tone(55, t, 0.3, 1.2, 'sine', rvIn, 0.12);
+    BAR_SCALE.forEach((m, i) => tone(mtof(m + 12), t + 0.15 + i * 0.07, 0.07, 0.35, 'sine', rvIn));
+  },
+  finale(notes, path) {
+    if (!AC || AC.state !== 'running') return;
+    const t = AC.currentTime + 0.01;
+    const uniq = [...new Set(notes)].sort((a, b) => a - b).slice(0, 8);
+    uniq.forEach((m, i) => {
+      const f = mtof(m + 12);
+      tone(f, t + i * 0.055, 0.14, 2.6, 'sine', rvIn, 0.01);
+      tone(f * (path === 'L' ? 3 : 2.76), t + i * 0.055, 0.03, 1.0, 'sine', rvIn);
+    });
+    tone(mtof(43), t, 0.35, 2.8, 'sine', rvIn, 0.02); tone(mtof(31), t, 0.4, 2.2, 'sine', master, 0.01, mtof(29));
+    partials(1320, t + 0.1, [[1, 0.06, 3], [2.43, 0.03, 2]], 1, rvIn);
+  },
+  tick(f) {
+    if (!canPlay(1, 0.15, false)) return;
+    const t = AC.currentTime + 0.003;
+    tone(f || 420, t, 0.08, 0.06, 'triangle');
+  },
+};
+function play(name, ...a) { try { SND[name](...a); } catch (e) { /* 音が出なくても遊びは止めない */ } }
+
+/* ============================================================
+   GAME LOGIC
+   ============================================================ */
+function flyingCount() { let n = 0; for (const b of S.balls) if (b.state === 'fly') n++; return n; }
+function songLen(c) { return c.queue.length + c.played.length; }
+
+function tapInstrument(inst) {
+  const mat = INSTMAT[inst];
+  const st = trayStats(true);
+  S.inst[inst].hit = S.t;
+  S.uses[inst]++;
+  // 楽器そのものの音(蓄積で少し音程が上がる)
+  const pm = 1 + Math.min(10, st.total) * 0.018;
+  play(inst, pm);
+  instrumentParticles(inst);
+  const c = S.concert;
+  if (c && (c.phase === 'open' || c.phase === 'play')) {
+    if (songLen(c) + S.pending.length >= SONG_MAX) return; // 上限:音と動きだけ
+    c.adds++;
+  }
+  if (S.pending.length || flyingCount() >= MAX_FLY) { S.pending.push(inst); return; }
+  launch(inst);
+}
+function launch(inst) {
+  const mat = INSTMAT[inst];
+  const p = emitPoint(inst);
+  const b = { id: S.nextId++, mat, src: inst, state: 'fly', u: 0, x: p.x, y: p.y, p0: p, spin: 0, spinV: mat === 'brass' ? 14 : mat === 'glass' ? 3 : 1, scale: 1, landT: -9 };
+  const c = S.concert;
+  if (c && (c.phase === 'open' || c.phase === 'play')) {
+    if (songLen(c) >= SONG_MAX) return;
+    b.inQueue = true; c.queue.push(b);
+  } else {
+    b.side = SIDE[mat]; S.bowls[b.side].push(b);
+  }
+  S.balls.push(b);
+  if (S.firstVisual < 0) S.firstVisual = S.t;
+}
+function ballTarget(b) {
+  if (b.inQueue) {
+    const c = S.concert; const i = c ? Math.max(0, c.queue.indexOf(b)) : 0;
+    const lp = lineLocal(c ? c.path : 'R', i); return trayWorld(lp.x, lp.y);
+  }
+  const k = Math.max(0, S.bowls[b.side].indexOf(b)), lp = bowlLocal(b.side, k);
+  return trayWorld(lp.x, lp.y);
+}
+function arrive(b) {
+  if (b.inQueue) { b.state = 'line'; return; }
+  b.state = 'bowl'; b.landT = S.t; S.landings++;
+  const st = trayStats(false);
+  const k = S.bowls[b.side].indexOf(b);
+  const m = 1 + k * 0.045 + st.total * 0.015;
+  play('land', b.mat, m, 1);
+  const w = WEIGHT[b.mat], dir = b.side === 'R' ? 1 : -1;
+  S.tray.vel += dir * (0.35 + w * 0.32);
+  S.tray.sagV += 0.25 + w * 0.22;
+  landParticles(b);
+  evaluate(b.side);
+}
+function evaluate(side) {
+  if (S.concert) return;
+  const st = trayStats(false);
+  const sideCount = side === 'L' ? st.nL : st.nR;
+  const sideHeavy = side === 'L' ? st.d < -BAL_TOL : st.d > BAL_TOL;
+  if (side && sideCount >= SIDE_CAP && sideHeavy) { release(side); return; }
+  if (st.total >= FULL) { release(st.bal ? 'C' : st.d > 0 ? 'R' : 'L'); return; }
+  if (st.bal && !S.balanced) { S.balanced = true; onBalanced(); }
+  else if (!st.bal && S.balanced) { S.balanced = false; play('gate', false); }
+}
+function onBalanced() {
+  play('gate', true);
+  play('success');
+  // 中央の特別な音階で、溝の並びをひと撫で
+  const seq = [...S.bowls.L, ...S.bowls.R].filter(b => b.state === 'bowl').sort((a, b) => a.id - b.id);
+  const occ = { iron: 0, brass: 0, glass: 0 };
+  seq.forEach((b, i) => {
+    const reg = CHIME_REG[b.mat], j = reg[occ[b.mat]++ % reg.length];
+    at(0.35 + i * 0.13, () => { if (!S.balanced) return; play('chime', CHIME_SCALE[j], null, 0.7); S.barGlow.C[j] = S.t; S.beadGlow[b.id] = S.t; });
+  });
+  for (let i = 0; i < 18; i++) addPart(L.cx + (R0() - 0.5) * L.br * 3, L.pivotY + L.hang, (R0() - 0.5) * 120, -R0() * 120, 'glint', 0.9);
+}
+function release(path) {
+  const all = [...S.bowls.L, ...S.bowls.R];
+  const landed = all.filter(b => b.state === 'bowl').sort((a, b) => a.id - b.id);
+  const flying = all.filter(b => b.state !== 'bowl').sort((a, b) => a.id - b.id);
+  S.bowls = { L: [], R: [] };
+  const queue = landed.concat(flying);
+  for (const b of queue) { b.inQueue = true; if (b.state === 'bowl') b.state = 'line'; }
+  S.balanced = false;
+  S.releases.push(path);
+  startConcert(path, queue, -1);
+  play('spill');
+  const end = path === 'C' ? trayWorld(0, L.hang) : trayWorld((path === 'L' ? -1 : 1) * L.Lh, L.hang);
+  for (let i = 0; i < 20; i++) addPart(end.x, end.y, (R0() - 0.5) * 160, -R0() * 140, 'dust', 1.1);
+}
+function startConcert(path, queue, replayRow) {
+  S.concert = { phase: 'open', t: 0, path, queue, played: [], notes: [], replayRow, adds: 0, occ: { iron: 0, brass: 0, glass: 0 }, nextT: 0, trN: 0, lastDisp: 0 };
+  S.stageTarget = 1;
+  play('stage');
+  if (path === 'C') play('gate', true);
+}
+function dispense(c) {
+  const b = c.queue.shift();
+  const occ = c.occ[b.mat]++;
+  if (c.path === 'C') { const reg = CHIME_REG[b.mat]; b.note = reg[occ % reg.length]; b.layer = 'back'; }
+  else { const reg = BAR_REG[b.mat]; b.note = reg[occ % reg.length]; b.layer = 'front'; }
+  b.state = 'drop'; b.u = 0; b.p0 = { x: b.x, y: b.y }; b.path = c.path;
+  c.played.push(b.mat);
+  c.lastDisp = c.t;
+}
+function dropTarget(b) {
+  return b.path === 'C' ? chimeHit(b.note) : barPos(b.path, b.note);
+}
+function strike(b) {
+  const c = S.concert;
+  const midi = b.path === 'C' ? CHIME_SCALE[b.note] : BAR_SCALE[b.note];
+  if (b.path === 'L') play('xylo', midi, b.mat);
+  else if (b.path === 'R') play('metal', midi, b.mat);
+  else play('chime', midi, b.mat, 1);
+  S.barGlow[b.path][b.note] = S.t;
+  S.log.push({ t: +S.t.toFixed(3), id: b.id, mat: b.mat, path: b.path, note: midi });
+  if (S.log.length > 200) S.log.shift();
+  if (c) c.notes.push(midi);
+  const p = { x: b.x, y: b.y };
+  const type = b.mat === 'iron' ? 'spark' : b.mat === 'brass' ? 'glint' : 'shard';
+  for (let i = 0; i < 8; i++) addPart(p.x, p.y, (R0() - 0.5) * 140, -R0() * 120, type, 0.6);
+  b.state = 'bounce'; b.u = 0; b.p0 = p; b.tk = c ? c.trN++ : 0;
+}
+function concertUpdate(dt) {
+  const c = S.concert; if (!c) return;
+  c.t += dt;
+  if (c.phase === 'open') {
+    if (c.t >= 0.9) { c.phase = 'play'; c.t = 0; c.nextT = 0; }
+  } else if (c.phase === 'play') {
+    if (c.queue.length && c.t >= c.nextT) {
+      const f = c.queue[0];
+      if (f.state === 'line') {
+        const lp = lineLocal(c.path, 0), w = trayWorld(lp.x, lp.y);
+        if (Math.hypot(f.x - w.x, f.y - w.y) < L.br * 0.8) { dispense(c); c.nextT = c.t + DISP_DT; }
+      }
+    }
+    const busy = S.balls.some(b => b.inQueue && (b.state === 'drop' || b.state === 'bounce' || b.state === 'fly' || b.state === 'line'));
+    if (!c.queue.length && !busy && !S.pending.length && c.t - c.lastDisp > 0.5) {
+      c.phase = 'finale'; c.t = 0; S.reso = S.t;
+      play('finale', c.notes, c.path);
+      for (const b of S.balls) if (b.state === 'trough') b.resoT = S.t;
+      for (let i = 0; i < 40; i++) addPart(L.left + R0() * L.Wc, L.stTop + R0() * (L.y1 - L.stTop), (R0() - 0.5) * 60, -40 - R0() * 80, R0() < 0.5 ? 'glint' : 'shard', 1.6);
+    }
+  } else if (c.phase === 'finale') {
+    if (c.t >= 2.3 && !c.saved) {
+      c.saved = true;
+      const song = { mats: c.played.slice(0, SONG_MAX), path: c.path };
+      let slot;
+      if (c.replayRow >= 0 && S.rows[c.replayRow]) { S.rows[c.replayRow] = song; slot = c.replayRow; }
+      else { S.rows.push(song); if (S.rows.length > 3) S.rows.shift(); slot = S.rows.length - 1; }
+      song.ready = S.t + 0.75;
+      const tb = S.balls.filter(b => b.state === 'trough').sort((a, b) => a.tk - b.tk);
+      tb.forEach((b, k) => { const tp = rowBallPos(slot, Math.min(k, song.mats.length - 1), song.mats.length); b.state = 'toRow'; b.u = 0; b.p0 = { x: b.x, y: b.y }; b.p1 = tp; b.delay = k * 0.02; });
+      c.phase = 'close'; c.t = 0; S.stageTarget = 0;
+    }
+  } else if (c.phase === 'close') {
+    if (c.t >= 1.0) endConcert();
+  }
+}
+function endConcert() {
+  const c = S.concert; S.concert = null;
+  if (c.replayRow < 0) {
+    S.cycle++;
+    S.goal = c.path === 'C' ? 'R' : c.path === 'R' ? 'L' : null;
+    S.demoShown = false;
+    S.uses = { drum: 0, bell: 0, tri: 0 };
+  }
+  S.balls = S.balls.filter(b => !(b.inQueue && (b.state === 'trough' || b.state === 'toRow')));
+  // 終幕中に積んだ玉の判定
+  const st = trayStats(false);
+  S.balanced = false;
+  if (st.total) evaluate(st.nL >= st.nR ? 'L' : 'R');
+}
+function replayRow(i) {
+  const song = S.rows[i]; if (!song || S.concert) return;
+  S.rowTried = true; S.rowTap[i] = S.t;
+  const q = song.mats.map((mat, k) => {
+    const p = rowBallPos(i, k, song.mats.length);
+    return { id: S.nextId++, mat, state: 'line', inQueue: true, x: p.x, y: p.y, spin: 0, spinV: mat === 'brass' ? 6 : 1, scale: 1, landT: -9 };
+  });
+  q.forEach(b => S.balls.push(b));
+  play('tick', 700);
+  startConcert(song.path, q, i);
+}
+
+/* ---------- guidance ---------- */
+const MOVES = [{ inst: 'bell', side: 'L', dw: -1 }, { inst: 'tri', side: 'L', dw: -2 }, { inst: 'drum', side: 'R', dw: 4 }];
+const memo = new Map();
+function canReachC(nL, nR, d) {
+  const key = nL * 1000 + nR * 50 + d + 25;
+  if (memo.has(key)) return memo.get(key);
+  let ok = false;
+  for (const m of MOVES) {
+    const nl = nL + (m.side === 'L'), nr = nR + (m.side === 'R'), dd = d + m.dw;
+    const sc = m.side === 'L' ? nl : nr, heavy = m.side === 'L' ? dd < -BAL_TOL : dd > BAL_TOL;
+    if (sc >= SIDE_CAP && heavy) continue;
+    if (nl + nr >= FULL) { if (nl > 0 && nr > 0 && Math.abs(dd) <= BAL_TOL) { ok = true; break; } continue; }
+    if (canReachC(nl, nr, dd)) { ok = true; break; }
+  }
+  memo.set(key, ok); return ok;
+}
+let tgtKey = '', tgtVal = null;
+function computeTarget() {
+  const c = S.concert;
+  if (c) {
+    if (c.phase === 'play' || (c.phase === 'open' && c.t > 0.5)) return ['bell', 'tri', 'drum'][c.adds % 3];
+    return null;
+  }
+  const st = trayStats(true);
+  if (st.total === 0 && S.rows.length && !S.rowTried && S.cycle >= 1) return 'row' + (S.rows.length - 1);
+  const key = [st.nL, st.nR, st.d, S.goal, S.uses.bell > 1, S.uses.tri > 0].join(',');
+  if (key === tgtKey) return tgtVal;
+  tgtKey = key;
+  let v;
+  if (S.goal === 'R') v = 'drum';
+  else if (S.goal === 'L') v = (st.nL >= 2 && S.uses.tri === 0) ? 'tri' : 'bell';
+  else if (st.total === 0 || st.nR === 0) v = 'drum';
+  else {
+    let best = null, bs = 1e9;
+    for (const m of MOVES) {
+      const nl = st.nL + (m.side === 'L'), nr = st.nR + (m.side === 'R'), dd = st.d + m.dw;
+      let reach;
+      const sc = m.side === 'L' ? nl : nr, heavy = m.side === 'L' ? dd < -BAL_TOL : dd > BAL_TOL;
+      if (sc >= SIDE_CAP && heavy) reach = false;
+      else if (nl + nr >= FULL) reach = nl > 0 && nr > 0 && Math.abs(dd) <= BAL_TOL;
+      else reach = canReachC(nl, nr, dd);
+      let sc2 = Math.abs(dd) + (reach ? 0 : 20);
+      if (m.inst === 'bell' && S.uses.bell < 2) sc2 -= 1.5;
+      if (m.inst === 'tri' && S.uses.bell < 2) sc2 += 1.5;
+      if (sc2 < bs) { bs = sc2; best = m.inst; }
+    }
+    v = best;
+  }
+  tgtVal = v; return v;
+}
+
+/* ---------- input ---------- */
+const activePointers = new Set();
+function hitTest(x, y) {
+  const cands = [];
+  const d = L.drum || { x: L.cx, y: L.drumY };
+  const dd = Math.hypot(x - L.cx, y - L.drumY) / (L.R * 1.08);
+  if (dd <= 1) cands.push(['drum', dd]);
+  for (const k of ['bell', 'tri']) {
+    const o = L[k], rr = Math.max(o.s * 1.25, 42);
+    const dk = Math.hypot(x - o.x, y - (o.y - o.s * 0.2)) / rr;
+    if (dk <= 1) cands.push([k, dk]);
+  }
+  if (cands.length) { cands.sort((a, b) => a[1] - b[1]); return cands[0][0]; }
+  for (let i = 0; i < 3; i++) {
+    const sl = L.slots[i];
+    if (S.rows[i] && x >= sl.x && x <= sl.x + sl.w && y >= sl.y - 6 && y <= sl.y + sl.h + 6) return 'row' + i;
+  }
+  // お盆(小さく揺れるだけ)
+  const a = S.tray.ang, cs = Math.cos(-a), sn = Math.sin(-a), dx = x - L.cx, dy = y - L.pivotY;
+  const xl = dx * cs - dy * sn, yl = dx * sn + dy * cs;
+  if (Math.abs(xl) <= L.Lh + L.br && yl >= -L.br && yl <= L.hang + L.th + L.br) return 'tray';
+  return null;
+}
+function onDown(e) {
+  e.preventDefault();
+  if (activePointers.has(e.pointerId)) return;   // 同じ指の二重入力を防ぐ
+  activePointers.add(e.pointerId);
+  try { cv.setPointerCapture && cv.setPointerCapture(e.pointerId); } catch (er) {}
+  initAudio();
+  const x = e.clientX, y = e.clientY;
+  const h = hitTest(x, y);
+  if (!h) return; // 空白は反応しない
+  S.lastInput = S.t; S.demo = null;
+  if (S.firstTap < 0) S.firstTap = S.t;
+  if (h === 'drum' || h === 'bell' || h === 'tri') tapInstrument(h);
+  else if (h.startsWith('row')) {
+    const i = +h.slice(3);
+    if (S.concert) { S.rowTap[i] = S.t; return; }
+    replayRow(i);
+  } else if (h === 'tray') {
+    S.tray.vel += (R0() - 0.5) * 0.3; S.trayTap = S.t; play('tick', 300);
+  }
+}
+function onUp(e) { activePointers.delete(e.pointerId); try { cv.releasePointerCapture && cv.releasePointerCapture(e.pointerId); } catch (er) {} }
+cv.addEventListener('pointerdown', onDown, { passive: false });
+cv.addEventListener('pointerup', onUp);
+cv.addEventListener('pointercancel', onUp);
+cv.addEventListener('lostpointercapture', e => activePointers.delete(e.pointerId));
+window.addEventListener('blur', () => activePointers.clear());
+for (const ev of ['touchstart', 'touchmove', 'touchend']) document.addEventListener(ev, e => { if (e.cancelable) e.preventDefault(); }, { passive: false });
+for (const ev of ['gesturestart', 'gesturechange', 'gestureend', 'contextmenu', 'dblclick', 'selectstart']) document.addEventListener(ev, e => e.preventDefault(), { passive: false });
+
+/* ---------- particles ---------- */
+function addPart(x, y, vx, vy, type, life) {
+  if (S.parts.length >= MAX_PART) S.parts.shift();
+  S.parts.push({ x, y, vx, vy, type, life, max: life, s: 0.6 + R0() });
+}
+function instrumentParticles(inst) {
+  if (inst === 'drum') { for (let i = 0; i < 10; i++) { const a = R0() * 6.28; addPart(L.cx + Math.cos(a) * L.R * 0.8, L.drumY + Math.sin(a) * L.R * 0.8, Math.cos(a) * 60, Math.sin(a) * 60 - 30, 'dust', 0.6); } }
+  else if (inst === 'bell') { for (let i = 0; i < 8; i++) addPart(L.bell.x + (R0() - 0.5) * L.bell.s, L.bell.y - L.bell.s * 0.3, (R0() - 0.5) * 120, -R0() * 100, 'glint', 0.6); }
+  else { for (let i = 0; i < 8; i++) addPart(L.tri.x + (R0() - 0.5) * L.tri.s, L.tri.y, (R0() - 0.5) * 80, -R0() * 80, 'shard', 1.2); }
+}
+function landParticles(b) {
+  const type = b.mat === 'iron' ? 'spark' : b.mat === 'brass' ? 'glint' : 'shard';
+  const n = b.mat === 'iron' ? 10 : 7;
+  for (let i = 0; i < n; i++) addPart(b.x, b.y + L.br * 0.7, (R0() - 0.5) * 150, -R0() * 110, i % 3 ? type : 'dust', 0.55 + R0() * 0.3);
+}
+
+/* ---------- update ---------- */
+function update(dt) {
+  S.t += dt;
+  for (let i = 0; i < S.ev.length;) { if (S.ev[i].t <= S.t) { const e = S.ev.splice(i, 1)[0]; try { e.f(); } catch (er) {} } else i++; }
+  while (S.pending.length && flyingCount() < MAX_FLY) launch(S.pending.shift());
+  const c = S.concert;
+  // お盆の目標角
+  const st = trayStats(false);
+  let target;
+  const forced = c && (c.phase === 'open' || c.phase === 'play');
+  if (forced) target = c.path === 'L' ? -MAXA : c.path === 'R' ? MAXA : 0;
+  else if (st.bal) target = 0;
+  else target = MAXA * Math.tanh(st.d / TILTK);
+  const T = S.tray;
+  if (S.reso > 0 && S.t - S.reso < 2.2) target += Math.sin((S.t - S.reso) * 14) * 0.02 * (1 - (S.t - S.reso) / 2.2);
+  T.vel += (60 * (target - T.ang) - 8.5 * T.vel) * dt;
+  T.ang += T.vel * dt;
+  T.ang = clamp(T.ang, -MAXA * 1.25, MAXA * 1.25);
+  T.sagV += (-260 * T.sag - 12 * T.sagV) * dt; T.sag += T.sagV * dt;
+  const gateOpen = (forced && c.path === 'C') || (!forced && S.balanced);
+  T.gate += ((gateOpen ? 1 : 0) - T.gate) * Math.min(1, dt * 7);
+  S.stage += ((S.stageTarget || 0) - S.stage) * Math.min(1, dt * 3.4);
+  if (Math.abs(S.stage - (S.stageTarget || 0)) < 0.002) S.stage = S.stageTarget || 0;
+  // 玉
+  for (const b of S.balls) {
+    b.spin += b.spinV * dt;
+    if (b.state === 'fly') {
+      b.u += dt / FLY_DUR;
+      const p1 = ballTarget(b), p0 = b.p0, u = Math.min(1, b.u);
+      const peak = Math.min(p0.y, p1.y) - L.arcH, Hh = (p0.y + p1.y) / 2 - peak;
+      b.x = lerp(p0.x, p1.x, u); b.y = lerp(p0.y, p1.y, u) - 4 * Hh * u * (1 - u) + 0;
+      if (b.u >= 1) arrive(b);
+    } else if (b.state === 'bowl') {
+      const k = S.bowls[b.side].indexOf(b), lp = bowlLocal(b.side, Math.max(0, k));
+      const w = trayWorld(lp.x, lp.y), lt = S.t - b.landT;
+      const amp = b.mat === 'glass' ? 0.95 : b.mat === 'brass' ? 0.4 : 0.15;
+      const bo = lt < 1.2 ? Math.abs(Math.sin(lt * 15)) * amp * L.br * Math.exp(-lt * 4.5) : 0;
+      b.x = w.x; b.y = w.y - bo;
+      b.spinV *= Math.exp(-dt * 0.6);
+    } else if (b.state === 'line') {
+      const cc = S.concert; const i = cc ? Math.max(0, cc.queue.indexOf(b)) : 0;
+      const lp = lineLocal(cc ? cc.path : 'R', i), w = trayWorld(lp.x, lp.y);
+      const k = Math.min(1, dt * 9);
+      b.x += (w.x - b.x) * k; b.y += (w.y - b.y) * k;
+    } else if (b.state === 'drop') {
+      b.u += dt / DROP_DUR;
+      const u = Math.min(1, b.u), p1 = dropTarget(b), p0 = b.p0;
+      const hop = L.br * 1.6;
+      b.x = lerp(p0.x, p1.x, Math.sqrt(u)); b.y = p0.y + (p1.y - p0.y) * u * u - hop * 4 * u * (1 - u);
+      if (b.u >= 1) strike(b);
+    } else if (b.state === 'bounce') {
+      const dur = b.path === 'C' ? 0.7 : 0.45;
+      b.u += dt / dur;
+      const u = Math.min(1, b.u), p1 = troughPos(b.tk), p0 = b.p0, hb = L.br * 2.2;
+      b.x = lerp(p0.x, p1.x, u); b.y = lerp(p0.y, p1.y, u * u) - hb * 4 * u * (1 - u);
+      if (b.u >= 1) { b.state = 'trough'; b.landT = S.t; play('land', b.mat, 0.8 + (b.tk % 8) * 0.03, 0.35); }
+    } else if (b.state === 'trough') {
+      const p = troughPos(b.tk), lt = S.t - b.landT;
+      const bo = lt < 0.8 ? Math.abs(Math.sin(lt * 14)) * L.br * 0.4 * Math.exp(-lt * 5) : 0;
+      b.x = p.x; b.y = p.y - bo;
+      b.spinV *= Math.exp(-dt * 2);
+    } else if (b.state === 'toRow') {
+      b.u += dt / 0.7;
+      const u = ease(Math.max(0, b.u - b.delay) / (1 - Math.min(0.5, b.delay)));
+      b.x = lerp(b.p0.x, b.p1.x, u); b.y = lerp(b.p0.y, b.p1.y, u) - L.br * 2 * 4 * u * (1 - u);
+      b.scale = lerp(1, L.tiny / L.br, u);
+      if (b.u >= 1.1) b.dead = true;
+    }
+  }
+  if (S.balls.some(b => b.dead)) S.balls = S.balls.filter(b => !b.dead);
+  concertUpdate(dt);
+  // 粒子
+  for (const p of S.parts) { p.life -= dt; p.vy += (p.type === 'dust' ? 260 : p.type === 'shard' ? 90 : 200) * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= Math.exp(-dt * 1.5); }
+  if (S.parts.length && S.parts.some(p => p.life <= 0)) S.parts = S.parts.filter(p => p.life > 0);
+  // 誘導
+  S.target = computeTarget();
+  if (!S.demo && !S.demoShown && S.target && S.t - Math.max(0, S.lastInput) > 4 && !(c && c.phase === 'close')) {
+    S.demo = { t: 0, target: S.target }; S.demoShown = true;
+  }
+  if (S.demo) { S.demo.t += dt; if (S.demo.t > 2.0) S.demo = null; }
+}
+
+/* ============================================================
+   RENDER
+   ============================================================ */
+function targetPos(t) {
+  if (!t) return null;
+  if (t === 'drum') return { x: L.cx, y: L.drumY, r: L.R };
+  if (t === 'bell') return { x: L.bell.x, y: L.bell.y - L.bell.s * 0.2, r: L.bell.s * 1.1 };
+  if (t === 'tri') return { x: L.tri.x, y: L.tri.y - L.tri.s * 0.1, r: L.tri.s * 1.1 };
+  if (t.startsWith('row')) { const sl = L.slots[+t.slice(3)]; return { x: sl.x + sl.w / 2, y: sl.y + sl.h / 2, r: sl.w * 0.42 }; }
+  return null;
+}
+function hopFor(name) {
+  if (S.target !== name) return 0;
+  const p = (S.t % 1.6) / 1.6;
+  return p < 0.22 ? Math.sin(p / 0.22 * Math.PI) : 0;
+}
+function drawGlow(x, y, r, a, col) {
+  const g = ctx.createRadialGradient(x, y, r * 0.2, x, y, r);
+  g.addColorStop(0, `rgba(${col},${a})`); g.addColorStop(1, `rgba(${col},0)`);
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill();
+}
+function drawBall(b) {
+  const sp = C.ball[b.mat], s = sp.w * (b.scale || 1);
+  ctx.drawImage(sp.c, b.x - s / 2, b.y - s / 2, s, s);
+  if (b.mat === 'brass') {
+    ctx.save(); ctx.translate(b.x, b.y); ctx.rotate(b.spin); ctx.drawImage(C.band.c, -s / 2, -s / 2, s, s); ctx.restore();
+  }
+}
+function drawStage() {
+  const e = ease(S.stage), now = S.t;
+  // 巨大な木琴・鉄琴
+  ctx.save(); ctx.beginPath(); ctx.rect(0, L.stTop, W, L.y1 - L.stTop); ctx.clip();
+  const off = giantOff();
+  for (const side of ['L', 'R']) {
+    const gi = C['giant' + side];
+    ctx.drawImage(gi.o.c, gi.x, gi.y + off, gi.o.w, gi.o.h);
+    // 打たれたバーの光と共鳴
+    L.bars[side].forEach((b, i) => {
+      let a = 0; const lt = now - S.barGlow[side][i];
+      if (lt >= 0 && lt < 1.2) a = Math.exp(-lt * (side === 'L' ? 5 : 2.2));
+      if (S.reso > 0) { const rt = now - S.reso - (side === 'L' ? i : 7 - i) * 0.06; if (rt > 0 && rt < 2) a = Math.max(a, 0.6 * Math.exp(-rt * 1.5)); }
+      if (a > 0.02) {
+        ctx.globalCompositeOperation = 'lighter';
+        const col = side === 'L' ? '255,170,90' : '220,235,255';
+        const gx = b.x, gy = b.y + off, jit = Math.sin(lt * 70) * a * 1.5;
+        const gr = ctx.createLinearGradient(gx - b.w / 2, 0, gx + b.w / 2, 0);
+        gr.addColorStop(0, `rgba(${col},0)`); gr.addColorStop(0.5, `rgba(${col},${0.45 * a})`); gr.addColorStop(1, `rgba(${col},0)`);
+        ctx.fillStyle = gr; ctx.fillRect(gx - b.w / 2 + jit, gy - b.h / 2, b.w, b.h);
+        ctx.globalCompositeOperation = 'source-over';
+      }
+    });
+  }
+  // 受け溝の玉
+  for (const b of S.balls) if (b.state === 'trough' || (b.state === 'bounce' && b.u > 0.6 && b.layer !== 'back')) {
+    if (b.resoT) { const rt = now - b.resoT; if (rt < 2) { ctx.globalCompositeOperation = 'lighter'; drawGlow(b.x, b.y, L.br * 2, 0.35 * Math.exp(-rt), b.mat === 'iron' ? '200,210,220' : b.mat === 'brass' ? '255,200,90' : '200,240,255'); ctx.globalCompositeOperation = 'source-over'; } }
+    drawBall(b);
+  }
+  ctx.restore();
+  // 床板(左右に開く)
+  const pl = C.panelL, pr = C.panelR, slide = e * (W / 2 + 4);
+  if (slide < W / 2 + 2) {
+    ctx.save(); ctx.beginPath(); ctx.rect(0, pl.y, W, L.y1 - pl.y); ctx.clip();
+    ctx.drawImage(pl.o.c, -slide, pl.y, pl.o.w, pl.o.h);
+    ctx.drawImage(pr.o.c, W / 2 - 2 + slide, pr.y, pr.o.w, pr.o.h);
+    ctx.restore();
+  }
+  // 床の隙間からのぞく鍵盤のきらめき
+  if (e < 0.5) {
+    const k = (Math.sin(now * 1.3) + 1) / 2;
+    ctx.globalCompositeOperation = 'lighter';
+    for (const side of ['L', 'R']) {
+      const b = L.bars[side][1 + Math.floor((now * 0.4 + (side === 'L' ? 0 : 2)) % 3)];
+      drawGlow(b.x, L.stTop + L.slitH * 0.5, L.br * 1.2, 0.12 * k * (1 - e * 2), side === 'L' ? '255,170,90' : '220,235,255');
+    }
+    ctx.globalCompositeOperation = 'source-over';
+  }
+}
+function drawRows() {
+  for (let i = 0; i < 3; i++) {
+    const song = S.rows[i]; if (!song) continue;
+    if (song.ready && S.t < song.ready) continue;
+    const c = S.concert, playing = c && c.replayRow === i;
+    const lt = S.t - S.rowTap[i], wob = lt < 0.5 ? Math.sin(lt * 30) * Math.exp(-lt * 6) * 2 : 0;
+    const hop = hopFor('row' + i) * L.tiny * 1.2;
+    const n = song.mats.length;
+    ctx.globalAlpha = playing ? 0.3 : 1;
+    for (let k = 0; k < n; k++) {
+      const p = rowBallPos(i, k, n), sp = C.ball[song.mats[k]], s = sp.w * L.tiny / L.br;
+      const wave = S.target === 'row' + i ? Math.sin(S.t * 6 - k * 0.6) * L.tiny * 0.25 : 0;
+      ctx.drawImage(sp.c, p.x - s / 2 + wob, p.y - s / 2 - hop - Math.max(0, wave), s, s);
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+function drawHanger() {
+  const T = S.tray, px = L.cx, py = L.pivotY;
+  // 鉄の吊り棒
+  const rw = Math.max(4, L.br * 0.36);
+  let g = ctx.createLinearGradient(px - rw, 0, px + rw, 0);
+  g.addColorStop(0, '#1d1f20'); g.addColorStop(0.35, '#8f9497'); g.addColorStop(0.6, '#4a4e51'); g.addColorStop(1, '#151617');
+  ctx.fillStyle = g; ctx.fillRect(px - rw / 2, L.beamY + L.beamH * 0.5, rw, py - L.beamY - L.beamH * 0.5);
+  // 留め金
+  g = ctx.createLinearGradient(px - rw * 2, 0, px + rw * 2, 0);
+  g.addColorStop(0, '#2a2c2e'); g.addColorStop(0.4, '#9da2a6'); g.addColorStop(1, '#1a1b1c');
+  ctx.fillStyle = g; ctx.fillRect(px - rw * 1.6, L.beamY + L.beamH * 0.4, rw * 3.2, rw * 1.6);
+  // 支点と腕(お盆と一緒に回る)
+  ctx.save(); ctx.translate(px, py); ctx.rotate(T.ang);
+  const aw = L.br * 1.6;
+  ctx.fillStyle = g;
+  for (const s of [-1, 1]) {
+    ctx.save(); ctx.rotate(s * -0.55);
+    const ag = ctx.createLinearGradient(-rw, 0, rw, 0); ag.addColorStop(0, '#1f2122'); ag.addColorStop(0.45, '#8a8f93'); ag.addColorStop(1, '#202223');
+    ctx.fillStyle = ag; ctx.fillRect(-rw * 0.45, 0, rw * 0.9, L.hang * 1.15);
+    ctx.restore();
+  }
+  ctx.restore();
+  const pr = Math.max(6, L.br * 0.62);
+  g = ctx.createRadialGradient(px - pr * 0.35, py - pr * 0.35, 0, px, py, pr);
+  g.addColorStop(0, '#e2e5e7'); g.addColorStop(0.35, '#8c9195'); g.addColorStop(1, '#202224');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(px, py, pr, 0, 7); ctx.fill();
+  g = ctx.createRadialGradient(px, py, 0, px, py, pr * 0.35);
+  g.addColorStop(0, '#111'); g.addColorStop(1, '#4c5053');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(px, py, pr * 0.32, 0, 7); ctx.fill();
+}
+function drawChimes() {
+  const gt = S.tray.gate; if (gt < 0.02) return;
+  const e = ease(gt);
+  ctx.save(); ctx.translate(L.cx, L.pivotY); ctx.rotate(S.tray.ang);
+  ctx.globalAlpha = e;
+  const y0 = L.chimeY - (1 - e) * L.br * 2;
+  const x0 = L.chimes[0].x, x6 = L.chimes[6].x;
+  let g = ctx.createLinearGradient(0, y0 - 2, 0, y0 + 3);
+  g.addColorStop(0, '#f2d27a'); g.addColorStop(1, '#5a3a0c');
+  ctx.fillStyle = g; ctx.fillRect(x0 - L.br, y0 - 2, x6 - x0 + 2 * L.br, 4);
+  L.chimes.forEach((ch, j) => {
+    const lt = S.t - S.barGlow.C[j], vib = lt >= 0 && lt < 2 ? Math.sin(lt * 40) * Math.exp(-lt * 2.5) * 0.12 : 0;
+    ctx.save(); ctx.translate(ch.x, y0); ctx.rotate(vib);
+    const tw = Math.max(5, L.br * 0.55);
+    g = ctx.createLinearGradient(-tw / 2, 0, tw / 2, 0);
+    g.addColorStop(0, '#5a3a0c'); g.addColorStop(0.3, '#f6dc8c'); g.addColorStop(0.55, '#c99a3a'); g.addColorStop(1, '#4a2f08');
+    ctx.fillStyle = g; ctx.fillRect(-tw / 2, 2, tw, ch.len * e);
+    shade(ctx, -tw / 2, 2, tw, 3, 'v', [[0, 'rgba(255,250,220,0.7)'], [1, 'rgba(255,250,220,0)']]);
+    if (lt >= 0 && lt < 1.5) { ctx.globalCompositeOperation = 'lighter'; drawGlow(0, 2 + ch.len * 0.5, L.br * 1.6, 0.5 * Math.exp(-lt * 2.5), '255,210,110'); ctx.globalCompositeOperation = 'source-over'; }
+    ctx.restore();
+  });
+  ctx.restore();
+}
+function drawTray() {
+  const T = S.tray, tex = C.tray;
+  const ox = C.trayOX, oy = C.trayOY, tw = tex.w, th = tex.h;
+  for (const s of [-1, 1]) {
+    ctx.save(); ctx.translate(L.cx, L.pivotY); ctx.rotate(T.ang + s * T.sag);
+    // 左半分 / 右半分
+    if (s < 0) ctx.drawImage(tex.c, 0, 0, ox * DPR, th * DPR, -ox, -oy, ox, th);
+    else ctx.drawImage(tex.c, ox * DPR, 0, (tw - ox) * DPR, th * DPR, 0, -oy, tw - ox, th);
+    ctx.restore();
+  }
+  // 中央の溝(真ちゅうの扉)
+  ctx.save(); ctx.translate(L.cx, L.pivotY); ctx.rotate(T.ang);
+  const gw = L.br * 1.25, open = ease(T.gate), top = L.hang, th2 = L.th;
+  let g;
+  if (open > 0.02) {
+    g = ctx.createLinearGradient(0, top, 0, top + th2);
+    g.addColorStop(0, `rgba(5,2,1,${open})`); g.addColorStop(1, `rgba(26,12,5,${open})`);
+    ctx.fillStyle = g; ctx.fillRect(-gw * open, top - 1, gw * 2 * open, th2 + 1);
+  }
+  if (open > 0.05) { ctx.globalCompositeOperation = 'lighter'; drawGlow(0, top + th2, gw * 2.4, 0.35 * open, '255,200,100'); ctx.globalCompositeOperation = 'source-over'; }
+  for (const s of [-1, 1]) {
+    const px = s < 0 ? -gw - open * gw * 0.9 : open * gw * 0.9;
+    g = ctx.createLinearGradient(px, 0, px + gw, 0);
+    g.addColorStop(0, '#6b4610'); g.addColorStop(0.45, '#f1cf78'); g.addColorStop(1, '#7a5214');
+    ctx.fillStyle = g; ctx.fillRect(px, top - L.br * 0.12, gw, L.br * 0.36);
+    shade(ctx, px, top + L.br * 0.24, gw, L.br * 0.15, 'v', [[0, 'rgba(0,0,0,0.4)'], [1, 'rgba(0,0,0,0)']]);
+  }
+  ctx.restore();
+  // 正面の記録溝のビーズ(投入順)
+  const seq = [...S.bowls.L, ...S.bowls.R].filter(b => b.state === 'bowl').sort((a, b) => a.id - b.id);
+  const n = seq.length; if (!n) return;
+  const bead = L.br * 0.3, gap = Math.min(L.br * 0.8, (L.Lh * 1.6) / Math.max(1, n));
+  seq.forEach((b, i) => {
+    const xl = (i - (n - 1) / 2) * gap, yl = L.hang + L.th * 0.52;
+    const w = trayWorld(xl, yl), sp = C.ball[b.mat], s = sp.w * bead / L.br;
+    ctx.drawImage(sp.c, w.x - s / 2, w.y - s / 2, s, s);
+    const lt = S.t - (S.beadGlow[b.id] ?? -9);
+    if (lt < 0.8) { ctx.globalCompositeOperation = 'lighter'; drawGlow(w.x, w.y, bead * 3, 0.6 * (1 - lt / 0.8), '255,220,140'); ctx.globalCompositeOperation = 'source-over'; }
+  });
+}
+function drawDrum() {
+  const R = L.R, x = L.cx, y = L.drumY;
+  const lt = S.t - S.inst.drum.hit;
+  const hit = lt >= 0 && lt < 1.5 ? Math.exp(-lt * 3.2) : 0;
+  const shakeY = Math.sin(lt * 52) * hit * R * 0.025;
+  const hop = -hopFor('drum') * R * 0.06;
+  const reso = S.reso > 0 && S.t - S.reso < 2.2 ? Math.exp(-(S.t - S.reso) * 1.5) : 0;
+  const rs = reso ? Math.sin(S.t * 40) * reso * R * 0.012 : 0;
+  // 台
+  const lw = Math.max(6, R * 0.1);
+  for (const s of [-1, 1]) {
+    ctx.save(); ctx.translate(x + s * R * 0.55, y + R * 0.55);
+    const ang = Math.atan2(s * R * 0.4, L.y0 - (y + R * 0.55));
+    ctx.rotate(-ang);
+    const len = Math.hypot(R * 0.4, L.y0 - (y + R * 0.55));
+    woodGrain(ctx, -lw / 2, 0, lw, len, ['#2b170b', '#5a361f', '#24130a'], 'v', 51 + s, { n: 4, knots: 0 });
+    ctx.restore();
+  }
+  woodGrain(ctx, x - R * 0.8, y + R * 0.78, R * 1.6, lw * 0.8, ['#2b170b', '#5a361f', '#24130a'], 'h', 55, { n: 4, knots: 0 });
+  // 影
+  drawGlow(x, y + R * 0.95, R * 1.1, 0.35, '0,0,0');
+  ctx.save(); ctx.translate(x + rs, y + shakeY + hop);
+  const sq = 1 + hit * 0.025;
+  ctx.scale(sq, 1 / sq);
+  const sh = C.drumShell, hd = C.drumHead;
+  ctx.drawImage(sh.c, -sh.w / 2, -sh.h / 2, sh.w, sh.h);
+  ctx.drawImage(hd.c, -hd.w / 2, -hd.h / 2, hd.w, hd.h);
+  const hr = R * 0.8;
+  // 打面の沈み込みと戻り
+  const sink = lt >= 0 && lt < 0.6 ? Math.exp(-lt * 9) * (lt < 0.03 ? lt / 0.03 : 1) : 0;
+  if (sink > 0.01 || reso > 0.01) {
+    const sv = Math.max(sink, reso * 0.25 * Math.abs(Math.sin(S.t * 30)));
+    let g = ctx.createRadialGradient(0, 0, 0, 0, 0, hr);
+    g.addColorStop(0, `rgba(35,20,8,${0.55 * sv})`); g.addColorStop(0.6, `rgba(35,20,8,${0.2 * sv})`); g.addColorStop(0.86, `rgba(255,235,195,${0.28 * sv})`); g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, hr, 0, 7); ctx.fill();
+  }
+  if (lt >= 0 && lt < 0.7) {
+    for (let k = 0; k < 2; k++) {
+      const u = (lt - k * 0.12) / 0.55; if (u <= 0 || u >= 1) continue;
+      const rr = hr * u;
+      const g = ctx.createRadialGradient(0, 0, Math.max(0, rr - R * 0.06), 0, 0, rr + R * 0.04);
+      g.addColorStop(0, 'rgba(255,240,210,0)'); g.addColorStop(0.6, `rgba(255,240,210,${0.25 * (1 - u)})`); g.addColorStop(1, 'rgba(255,240,210,0)');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, rr + R * 0.04, 0, 7); ctx.fill();
+    }
+  }
+  // 上からの光沢
+  const g2 = ctx.createRadialGradient(-hr * 0.35, -hr * 0.45, 0, -hr * 0.35, -hr * 0.45, hr * 0.7);
+  g2.addColorStop(0, `rgba(255,240,210,${0.18 - sink * 0.12})`); g2.addColorStop(1, 'rgba(255,240,210,0)');
+  ctx.fillStyle = g2; ctx.beginPath(); ctx.arc(0, 0, hr, 0, 7); ctx.fill();
+  ctx.restore();
+}
+function suzu(x, y, r, rot) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot);
+  let g = ctx.createRadialGradient(-r * 0.35, -r * 0.4, r * 0.05, 0, 0, r);
+  g.addColorStop(0, '#fff0b4'); g.addColorStop(0.3, '#dcaa46'); g.addColorStop(0.75, '#8f601a'); g.addColorStop(1, '#45290a');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.fill();
+  // 帯の膨らみ
+  g = ctx.createLinearGradient(0, -r * 0.12, 0, r * 0.12);
+  g.addColorStop(0, 'rgba(90,55,10,0)'); g.addColorStop(0.5, 'rgba(255,225,140,0.35)'); g.addColorStop(1, 'rgba(90,55,10,0)');
+  ctx.save(); ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.clip(); ctx.fillStyle = g; ctx.fillRect(-r, -r * 0.12, 2 * r, r * 0.24); ctx.restore();
+  // 口(暗い切れ目)
+  g = ctx.createRadialGradient(0, r * 0.5, 0, 0, r * 0.5, r * 0.62);
+  g.addColorStop(0, 'rgba(10,5,0,0.95)'); g.addColorStop(0.5, 'rgba(10,5,0,0.6)'); g.addColorStop(1, 'rgba(10,5,0,0)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.ellipse(0, r * 0.5, r * 0.62, r * 0.12, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = 'rgba(255,250,225,0.75)'; ctx.beginPath(); ctx.ellipse(-r * 0.38, -r * 0.42, r * 0.2, r * 0.11, -0.6, 0, 7); ctx.fill();
+  ctx.restore();
+}
+function drawBell() {
+  const o = L.bell, s = o.s, lt = S.t - S.inst.bell.hit;
+  const hit = lt >= 0 && lt < 1 ? Math.exp(-lt * 4.5) : 0;
+  const hop = -hopFor('bell') * s * 0.12;
+  const idle = S.target === 'bell' ? 0 : Math.sin(S.t * 1.7) * 0.02;
+  const reso = S.reso > 0 && S.t - S.reso < 2 ? Math.exp(-(S.t - S.reso) * 1.5) : 0;
+  // 支柱
+  const pw = Math.max(5, s * 0.14), topY = o.y - s * 0.95;
+  woodGrain(ctx, o.x - pw / 2, topY, pw, L.y0 - topY, ['#2b170b', '#5d3820', '#24130a'], 'v', 61, { n: 4, knots: 0 });
+  woodGrain(ctx, o.x - s * 0.8, topY - pw * 0.4, s * 1.6, pw * 0.8, ['#2b170b', '#5d3820', '#24130a'], 'h', 62, { n: 4, knots: 0 });
+  drawGlow(o.x, L.y0, s * 0.8, 0.3, '0,0,0');
+  const bells = [[-0.5, -0.15, 0], [0.5, -0.15, 1], [0, 0.32, 2]];
+  for (const [bx, by, i] of bells) {
+    const rot = Math.sin(lt * 70 + i * 2) * hit * 0.4 + idle + Math.sin(S.t * 50 + i) * reso * 0.15;
+    const ax = o.x + bx * s * 0.75, ay = topY;
+    const cx = o.x + bx * s + Math.sin(rot) * s * 0.3, cy = o.y + by * s + hop;
+    // 紐(麻の色、細い)
+    ctx.strokeStyle = 'rgba(150,100,55,0.85)'; ctx.lineWidth = Math.max(1.5, s * 0.04);
+    ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(cx, cy - s * 0.3); ctx.stroke();
+    suzu(cx, cy, s * 0.34, rot);
+  }
+}
+function drawTri() {
+  const o = L.tri, s = o.s, lt = S.t - S.inst.tri.hit;
+  const ring = lt >= 0 && lt < 3 ? Math.exp(-lt * 1.1) : 0;
+  const hop = -hopFor('tri') * s * 0.12;
+  const reso = S.reso > 0 && S.t - S.reso < 2.2 ? Math.exp(-(S.t - S.reso) * 1.2) : 0;
+  // 吊り台
+  const pw = Math.max(5, s * 0.14), armY = o.y - s * 1.35, postX = o.x + s * 0.95;
+  woodGrain(ctx, postX - pw / 2, armY, pw, L.y0 - armY, ['#2b170b', '#5d3820', '#24130a'], 'v', 71, { n: 4, knots: 0 });
+  woodGrain(ctx, o.x - pw, armY - pw * 0.4, postX - o.x + pw * 1.5, pw * 0.8, ['#2b170b', '#5d3820', '#24130a'], 'h', 72, { n: 4, knots: 0 });
+  drawGlow(postX, L.y0, s * 0.6, 0.3, '0,0,0');
+  const sway = Math.sin(lt * 9) * ring * 0.12 + (S.target === 'tri' ? 0 : Math.sin(S.t * 1.3) * 0.02) + Math.sin(S.t * 40) * reso * 0.04;
+  const topY = o.y - s * 0.78 + hop;
+  ctx.strokeStyle = 'rgba(150,100,55,0.85)'; ctx.lineWidth = Math.max(1.5, s * 0.04);
+  ctx.beginPath(); ctx.moveTo(o.x, armY); ctx.lineTo(o.x + Math.sin(sway) * s * 0.3, topY); ctx.stroke();
+  ctx.save(); ctx.translate(o.x + Math.sin(sway) * s * 0.3, topY); ctx.rotate(sway);
+  const vib = Math.sin(lt * 90) * ring * s * 0.012;
+  const a = [0, 0], b = [-s * 0.74 + vib, s * 1.3], c2 = [s * 0.74 - vib, s * 1.3];
+  // 鋼の棒(太い描画で材そのものを表す)
+  const g = ctx.createLinearGradient(-s * 0.8, 0, s * 0.8, s * 1.3);
+  g.addColorStop(0, '#5a6064'); g.addColorStop(0.3, '#eef1f3'); g.addColorStop(0.5, '#8a9196'); g.addColorStop(0.7, '#dfe3e6'); g.addColorStop(1, '#40464a');
+  ctx.strokeStyle = g; ctx.lineWidth = Math.max(4, s * 0.1); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.beginPath(); ctx.moveTo(b[0] + s * 0.12, b[1] - s * 0.2); ctx.lineTo(a[0], a[1]); ctx.lineTo(c2[0], c2[1]); ctx.lineTo(b[0] + s * 0.14, b[1]); ctx.stroke();
+  // 余韻のきらめきが棒を走る
+  if (ring > 0.02 || reso > 0.02) {
+    const v = Math.max(ring, reso);
+    const u = (S.t * 1.7) % 1, pts = [[b[0] + s * 0.12, b[1] - s * 0.2], a, c2, [b[0] + s * 0.14, b[1]]];
+    const seg = Math.min(2, Math.floor(u * 3)), f = u * 3 - seg;
+    const px = lerp(pts[seg][0], pts[seg + 1][0], f), py = lerp(pts[seg][1], pts[seg + 1][1], f);
+    ctx.globalCompositeOperation = 'lighter';
+    drawGlow(px, py, s * 0.3, 0.7 * v, '255,250,235');
+    drawGlow(0, s * 0.8, s * 1.4, 0.13 * v, '230,240,255');
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  ctx.restore();
+}
+function drawParts() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const p of S.parts) {
+    const a = clamp(p.life / p.max, 0, 1);
+    let col, r = L.br * 0.13 * p.s;
+    if (p.type === 'spark') col = `rgba(255,${150 + 80 * a | 0},80,${a})`;
+    else if (p.type === 'glint') col = `rgba(255,215,120,${a * 0.9})`;
+    else if (p.type === 'shard') { col = `rgba(220,240,255,${a * 0.9})`; r *= 0.8; }
+    else { ctx.globalCompositeOperation = 'source-over'; col = `rgba(140,95,60,${a * 0.6})`; r *= 1.2; }
+    ctx.fillStyle = col; ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, 7); ctx.fill();
+    ctx.globalCompositeOperation = 'lighter';
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+function drawHand() {
+  const d = S.demo; if (!d) return;
+  const tp = targetPos(d.target); if (!tp) return;
+  const t = d.t;
+  let ax, ay, al;
+  const tx = tp.x + tp.r * 0.12, ty = tp.y + tp.r * 0.12;
+  const sx = tx + tp.r * 0.9, sy = ty + tp.r * 1.3;
+  if (t < 0.6) { const u = ease(t / 0.6); ax = lerp(sx, tx, u); ay = lerp(sy, ty, u); al = u; }
+  else if (t < 0.95) { const u = (t - 0.6) / 0.35, pr = Math.sin(u * Math.PI); ax = tx - pr * 4; ay = ty + pr * 6; al = 1; }
+  else { const u = ease((t - 0.95) / 1.05); ax = lerp(tx, sx, u); ay = lerp(ty, sy, u); al = 1 - u; }
+  const hs = clamp(L.R * 0.5, 34, 70);
+  ctx.save(); ctx.globalAlpha = al * 0.92; ctx.translate(ax, ay); ctx.rotate(-0.5);
+  drawGlow(hs * 0.15, hs * 0.85, hs * 0.75, 0.25, '0,0,0');
+  const skin = (x0, y0, x1, y1) => { const g = ctx.createLinearGradient(x0, y0, x1, y1); g.addColorStop(0, '#e2ad84'); g.addColorStop(0.5, '#c88a60'); g.addColorStop(1, '#8a5534'); return g; };
+  // 人差し指
+  ctx.fillStyle = skin(-hs * 0.12, 0, hs * 0.12, 0);
+  ctx.beginPath(); ctx.ellipse(0, hs * 0.32, hs * 0.11, hs * 0.36, 0, 0, 7); ctx.fill();
+  // 手のひら
+  ctx.fillStyle = skin(-hs * 0.3, hs * 0.5, hs * 0.4, hs * 1.1);
+  ctx.beginPath(); ctx.ellipse(hs * 0.12, hs * 0.82, hs * 0.3, hs * 0.32, 0.2, 0, 7); ctx.fill();
+  // 握った指の丸み
+  for (let i = 0; i < 3; i++) { ctx.beginPath(); ctx.ellipse(hs * (0.2 + i * 0.12), hs * (0.58 + i * 0.03), hs * 0.1, hs * 0.13, 0.3, 0, 7); ctx.fill(); }
+  ctx.fillStyle = 'rgba(255,230,205,0.45)'; ctx.beginPath(); ctx.ellipse(-hs * 0.03, hs * 0.08, hs * 0.04, hs * 0.07, 0, 0, 7); ctx.fill();
+  ctx.restore();
+}
+function draw() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.drawImage(C.bg.c, 0, 0, W, H);
+  // 共鳴で舞台全体が温かく光る
+  if (S.reso > 0 && S.t - S.reso < 2.5) {
+    const a = 0.22 * Math.exp(-(S.t - S.reso) * 1.3);
+    ctx.globalCompositeOperation = 'lighter';
+    drawGlow(L.cx, L.y0, Math.max(W, H) * 0.7, a, '255,170,90');
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  drawStage();
+  drawRows();
+  drawHanger();
+  drawChimes();
+  // 中央経路の玉(太鼓の後ろを通る)
+  for (const b of S.balls) if ((b.state === 'drop' || b.state === 'bounce') && b.layer === 'back') drawBall(b);
+  drawTray();
+  for (const b of S.balls) if (b.state === 'bowl' || b.state === 'line') drawBall(b);
+  // 誘導の光
+  const tg = S.target;
+  if (tg && !tg.startsWith('row')) {
+    const tp = targetPos(tg), pulse = 0.22 + 0.14 * Math.sin(S.t * 4);
+    ctx.globalCompositeOperation = 'lighter';
+    drawGlow(tp.x, tp.y, tp.r * 1.45, pulse, tg === 'drum' ? '255,170,100' : tg === 'bell' ? '255,210,110' : '220,235,255');
+    ctx.globalCompositeOperation = 'source-over';
+  } else if (tg) {
+    const tp = targetPos(tg);
+    ctx.globalCompositeOperation = 'lighter';
+    drawGlow(tp.x, tp.y, tp.r, 0.18 + 0.1 * Math.sin(S.t * 4), '255,200,120');
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  drawBell(); drawTri(); drawDrum();
+  for (const b of S.balls) if (b.state === 'fly' || ((b.state === 'drop' || (b.state === 'bounce' && b.u <= 0.6)) && b.layer !== 'back') || b.state === 'toRow') drawBall(b);
+  drawParts();
+  drawHand();
+}
+
+/* ---------- loop ---------- */
+let raf = 0, last = 0, running = true, needLayout = true;
+function frame(now) {
+  raf = 0;
+  if (!running) return;
+  if (needLayout) { needLayout = false; layout(); }
+  const dt = last ? Math.min(1 / 30, Math.max(0, (now - last) / 1000)) : 1 / 60;
+  last = now;
+  try { update(dt); draw(); } catch (e) { console.warn(e); }
+  raf = requestAnimationFrame(frame);
+}
+function start() { if (!raf && running) { last = 0; raf = requestAnimationFrame(frame); } }
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    running = false; if (raf) cancelAnimationFrame(raf); raf = 0; activePointers.clear();
+    if (AC && AC.state === 'running') { try { AC.suspend(); } catch (e) {} }
+  } else {
+    running = true; if (AC) { try { AC.resume(); } catch (e) {} } start();
+  }
+});
+window.addEventListener('pagehide', () => { running = false; if (raf) cancelAnimationFrame(raf); raf = 0; });
+window.addEventListener('pageshow', () => { if (!document.hidden) { running = true; start(); } });
+window.addEventListener('resize', () => { needLayout = true; });
+window.addEventListener('orientationchange', () => { needLayout = true; });
+
+// 自動テスト用の読み取り専用スナップショット
+window.__otodama = {
+  snap() {
+    const st = trayStats(false), c = S.concert;
+    return {
+      t: S.t, ang: S.tray.ang, gate: S.tray.gate, stage: S.stage, balanced: S.balanced, stats: st,
+      bowls: { L: S.bowls.L.map(b => b.mat + ':' + b.state), R: S.bowls.R.map(b => b.mat + ':' + b.state) },
+      concert: c ? { phase: c.phase, path: c.path, queue: c.queue.map(b => b.mat), played: c.played.slice(), adds: c.adds, replayRow: c.replayRow } : null,
+      rows: S.rows.map(r => ({ mats: r.mats.slice(), path: r.path })), target: S.target, demo: !!S.demo, demoShown: S.demoShown,
+      balls: S.balls.length, flying: flyingCount(), parts: S.parts.length, log: S.log.slice(), releases: S.releases.slice(),
+      firstTap: S.firstTap, firstVisual: S.firstVisual, drumHit: S.inst.drum.hit, cycle: S.cycle, goal: S.goal,
+      audio: AC ? AC.state : 'none', running, layout: { cx: L.cx, drumY: L.drumY, R: L.R, bell: L.bell, tri: L.tri, slots: L.slots, pivotY: L.pivotY, Lh: L.Lh, br: L.br, y0: L.y0, y1: L.y1 },
+    };
+  },
+};
+layout();
+start();
+})();
+</script>
+</body>
+</html>
